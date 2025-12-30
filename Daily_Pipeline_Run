@@ -1,0 +1,121 @@
+# ===========================================
+# 🔄 DAILY PIPELINE RUN
+# ===========================================
+# Runs all pipelines automatically every day at 6 AM CST
+# (which is when most business data updates)
+# ===========================================
+
+name: Daily Pipeline Run
+
+on:
+  # Run daily at 6 AM CST (12:00 UTC)
+  schedule:
+    - cron: '0 12 * * *'
+  
+  # Allow manual trigger
+  workflow_dispatch:
+    inputs:
+      skip_glassdoor:
+        description: 'Skip Glassdoor (rate limited)'
+        required: false
+        default: 'true'
+        type: boolean
+      skip_sec:
+        description: 'Skip SEC inventory data'
+        required: false
+        default: 'false'
+        type: boolean
+      generate_emails:
+        description: 'Generate outreach emails'
+        required: false
+        default: 'false'
+        type: boolean
+
+env:
+  PYTHON_VERSION: '3.13'
+
+jobs:
+  run-pipelines:
+    name: Run All Pipelines
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: 📥 Checkout code
+        uses: actions/checkout@v4
+      
+      - name: 🐍 Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+      
+      - name: 📦 Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      
+      - name: ⚙️ Create .env file
+        run: |
+          cat << EOF > .env
+          SUPABASE_URL=${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY=${{ secrets.SUPABASE_KEY }}
+          GEMINI_API_KEY=${{ secrets.GEMINI_API_KEY }}
+          FRED_API_KEY=${{ secrets.FRED_API_KEY }}
+          BLS_API_KEY=${{ secrets.BLS_API_KEY }}
+          SEC_USER_AGENT=PropensityEngine github-actions@example.com
+          TARGET_STATE=TX
+          TARGET_CITIES=Dallas,Fort Worth,Arlington,Irving,Plano
+          EOF
+      
+      - name: 🚀 Run pipelines
+        run: |
+          # Build command with options
+          CMD="python scripts/run_all_pipelines.py"
+          
+          if [ "${{ github.event.inputs.skip_glassdoor }}" = "true" ] || [ "${{ github.event_name }}" = "schedule" ]; then
+            CMD="$CMD --skip-glassdoor"
+          fi
+          
+          if [ "${{ github.event.inputs.skip_sec }}" = "true" ]; then
+            CMD="$CMD --skip-sec"
+          fi
+          
+          if [ "${{ github.event.inputs.generate_emails }}" = "true" ]; then
+            CMD="$CMD --generate-emails"
+          fi
+          
+          echo "Running: $CMD"
+          $CMD
+      
+      - name: 📊 Upload logs
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: pipeline-logs-${{ github.run_id }}
+          path: logs/
+          retention-days: 7
+      
+      - name: 📧 Notify on failure
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `Pipeline run failed on ${new Date().toISOString().split('T')[0]}`,
+              body: `The daily pipeline run failed. Check the [workflow run](${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}) for details.`,
+              labels: ['bug', 'pipeline']
+            })
+
+# ===========================================
+# 🔐 REQUIRED SECRETS
+# ===========================================
+# Set these in GitHub → Settings → Secrets → Actions:
+#
+# SUPABASE_URL      - Your Supabase project URL
+# SUPABASE_KEY      - Your Supabase anon/public key
+# GEMINI_API_KEY    - Google AI Studio API key
+# FRED_API_KEY      - FRED API key (optional but recommended)
+# BLS_API_KEY       - BLS API key (optional but recommended)
+# ===========================================
