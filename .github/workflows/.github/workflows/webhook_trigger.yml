@@ -1,0 +1,307 @@
+# ============================================================================
+# 🔗 WEBHOOK-TRIGGERED PIPELINE RUN
+# ============================================================================
+# COPY THIS FILE TO: .github/workflows/webhook_trigger.yml
+#
+# TRIGGERS:
+# 1. Repository dispatch (external API call)
+# 2. Workflow dispatch (manual with parameters)
+#
+# HOW TO TRIGGER VIA API:
+# curl -X POST \
+#   -H "Authorization: token YOUR_GITHUB_PAT" \
+#   -H "Accept: application/vnd.github.v3+json" \
+#   https://api.github.com/repos/YOUR_USERNAME/YOUR_REPO/dispatches \
+#   -d '{"event_type":"run_pipeline","client_payload":{"pipelines":"all","notify":true}}'
+#
+# TRIGGER SPECIFIC PIPELINE:
+# -d '{"event_type":"run_pipeline","client_payload":{"pipelines":"permits,jobs","notify":false}}'
+# ============================================================================
+
+name: "🔗 Webhook Pipeline Trigger"
+
+on:
+  # External API trigger
+  repository_dispatch:
+    types: [run_pipeline, run_scoring, run_export]
+  
+  # Manual trigger with full control
+  workflow_dispatch:
+    inputs:
+      pipelines:
+        description: 'Pipelines to run (comma-separated or "all")'
+        required: true
+        default: 'all'
+        type: choice
+        options:
+          - all
+          - permits
+          - warn
+          - macro
+          - glassdoor
+          - jobs
+          - inventory
+          - labor
+          - permits,warn,jobs
+          - scoring_only
+      
+      run_scoring:
+        description: 'Calculate propensity scores after pipelines'
+        required: true
+        default: true
+        type: boolean
+      
+      export_sheets:
+        description: 'Export results to Google Sheets'
+        required: false
+        default: true
+        type: boolean
+      
+      send_email:
+        description: 'Send email alert for hot leads'
+        required: false
+        default: false
+        type: boolean
+      
+      min_score:
+        description: 'Minimum score for hot lead alerts'
+        required: false
+        default: '75'
+        type: string
+
+env:
+  PYTHON_VERSION: '3.12'
+
+jobs:
+  # ==========================================
+  # DETERMINE WHAT TO RUN
+  # ==========================================
+  setup:
+    name: "⚙️ Parse Configuration"
+    runs-on: ubuntu-latest
+    outputs:
+      run_permits: ${{ steps.config.outputs.run_permits }}
+      run_warn: ${{ steps.config.outputs.run_warn }}
+      run_macro: ${{ steps.config.outputs.run_macro }}
+      run_glassdoor: ${{ steps.config.outputs.run_glassdoor }}
+      run_jobs: ${{ steps.config.outputs.run_jobs }}
+      run_inventory: ${{ steps.config.outputs.run_inventory }}
+      run_labor: ${{ steps.config.outputs.run_labor }}
+      run_scoring: ${{ steps.config.outputs.run_scoring }}
+      export_sheets: ${{ steps.config.outputs.export_sheets }}
+      send_email: ${{ steps.config.outputs.send_email }}
+      min_score: ${{ steps.config.outputs.min_score }}
+    
+    steps:
+      - name: "Parse trigger configuration"
+        id: config
+        run: |
+          # Get pipelines from dispatch or workflow input
+          if [ "${{ github.event_name }}" == "repository_dispatch" ]; then
+            PIPELINES="${{ github.event.client_payload.pipelines || 'all' }}"
+            RUN_SCORING="${{ github.event.client_payload.scoring || 'true' }}"
+            EXPORT_SHEETS="${{ github.event.client_payload.export || 'true' }}"
+            SEND_EMAIL="${{ github.event.client_payload.notify || 'false' }}"
+            MIN_SCORE="${{ github.event.client_payload.min_score || '75' }}"
+          else
+            PIPELINES="${{ inputs.pipelines }}"
+            RUN_SCORING="${{ inputs.run_scoring }}"
+            EXPORT_SHEETS="${{ inputs.export_sheets }}"
+            SEND_EMAIL="${{ inputs.send_email }}"
+            MIN_SCORE="${{ inputs.min_score }}"
+          fi
+          
+          echo "Requested pipelines: $PIPELINES"
+          
+          # Determine which pipelines to run
+          if [ "$PIPELINES" == "all" ]; then
+            echo "run_permits=true" >> $GITHUB_OUTPUT
+            echo "run_warn=true" >> $GITHUB_OUTPUT
+            echo "run_macro=true" >> $GITHUB_OUTPUT
+            echo "run_glassdoor=true" >> $GITHUB_OUTPUT
+            echo "run_jobs=true" >> $GITHUB_OUTPUT
+            echo "run_inventory=true" >> $GITHUB_OUTPUT
+            echo "run_labor=true" >> $GITHUB_OUTPUT
+          elif [ "$PIPELINES" == "scoring_only" ]; then
+            echo "run_permits=false" >> $GITHUB_OUTPUT
+            echo "run_warn=false" >> $GITHUB_OUTPUT
+            echo "run_macro=false" >> $GITHUB_OUTPUT
+            echo "run_glassdoor=false" >> $GITHUB_OUTPUT
+            echo "run_jobs=false" >> $GITHUB_OUTPUT
+            echo "run_inventory=false" >> $GITHUB_OUTPUT
+            echo "run_labor=false" >> $GITHUB_OUTPUT
+          else
+            # Parse comma-separated list
+            [[ "$PIPELINES" == *"permits"* ]] && echo "run_permits=true" >> $GITHUB_OUTPUT || echo "run_permits=false" >> $GITHUB_OUTPUT
+            [[ "$PIPELINES" == *"warn"* ]] && echo "run_warn=true" >> $GITHUB_OUTPUT || echo "run_warn=false" >> $GITHUB_OUTPUT
+            [[ "$PIPELINES" == *"macro"* ]] && echo "run_macro=true" >> $GITHUB_OUTPUT || echo "run_macro=false" >> $GITHUB_OUTPUT
+            [[ "$PIPELINES" == *"glassdoor"* ]] && echo "run_glassdoor=true" >> $GITHUB_OUTPUT || echo "run_glassdoor=false" >> $GITHUB_OUTPUT
+            [[ "$PIPELINES" == *"jobs"* ]] && echo "run_jobs=true" >> $GITHUB_OUTPUT || echo "run_jobs=false" >> $GITHUB_OUTPUT
+            [[ "$PIPELINES" == *"inventory"* ]] && echo "run_inventory=true" >> $GITHUB_OUTPUT || echo "run_inventory=false" >> $GITHUB_OUTPUT
+            [[ "$PIPELINES" == *"labor"* ]] && echo "run_labor=true" >> $GITHUB_OUTPUT || echo "run_labor=false" >> $GITHUB_OUTPUT
+          fi
+          
+          echo "run_scoring=$RUN_SCORING" >> $GITHUB_OUTPUT
+          echo "export_sheets=$EXPORT_SHEETS" >> $GITHUB_OUTPUT
+          echo "send_email=$SEND_EMAIL" >> $GITHUB_OUTPUT
+          echo "min_score=$MIN_SCORE" >> $GITHUB_OUTPUT
+
+  # ==========================================
+  # RUN SELECTED PIPELINES
+  # ==========================================
+  pipelines:
+    name: "🔧 Run Pipelines"
+    needs: setup
+    runs-on: ubuntu-latest
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+      
+      - name: "Install dependencies"
+        run: pip install -r requirements.txt
+
+      - name: "Configure environment"
+        run: |
+          cat > .env << 'EOF'
+          SUPABASE_URL=${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY=${{ secrets.SUPABASE_KEY }}
+          GEMINI_API_KEY=${{ secrets.GEMINI_API_KEY }}
+          FRED_API_KEY=${{ secrets.FRED_API_KEY }}
+          BLS_API_KEY=${{ secrets.BLS_API_KEY }}
+          SEC_USER_AGENT=PropensityEngine webhook@${{ github.repository }}
+          TARGET_CITIES=Dallas,Fort Worth,Arlington,Irving,Plano
+          TARGET_STATE=TX
+          WEIGHT_EXPANSION=0.25
+          WEIGHT_DISTRESS=0.20
+          WEIGHT_JOB_VELOCITY=0.20
+          WEIGHT_SENTIMENT=0.15
+          WEIGHT_MARKET_TIGHTNESS=0.10
+          WEIGHT_MACRO=0.10
+          EOF
+
+      - name: "🏗️ Permits Pipeline"
+        if: ${{ needs.setup.outputs.run_permits == 'true' }}
+        run: python -m pipelines.pipeline_1_permits
+        continue-on-error: true
+
+      - name: "⚠️ WARN Pipeline"
+        if: ${{ needs.setup.outputs.run_warn == 'true' }}
+        run: python -m pipelines.pipeline_2_warn
+        continue-on-error: true
+
+      - name: "📈 Macro Pipeline"
+        if: ${{ needs.setup.outputs.run_macro == 'true' }}
+        run: python -m pipelines.pipeline_3_macro
+        continue-on-error: true
+
+      - name: "⭐ Glassdoor Pipeline"
+        if: ${{ needs.setup.outputs.run_glassdoor == 'true' }}
+        run: |
+          python -c "
+          from pipelines import GlassdoorPipeline
+          GlassdoorPipeline().run(['Amazon', 'XPO Logistics', 'FedEx'])
+          "
+        continue-on-error: true
+
+      - name: "💼 Jobs Pipeline"
+        if: ${{ needs.setup.outputs.run_jobs == 'true' }}
+        run: python -m pipelines.pipeline_5_jobs
+        continue-on-error: true
+
+      - name: "📦 Inventory Pipeline"
+        if: ${{ needs.setup.outputs.run_inventory == 'true' }}
+        run: |
+          python -c "
+          from pipelines import InventoryPipeline
+          InventoryPipeline().run(['WMT', 'HD', 'TGT', 'COST', 'KR'])
+          "
+        continue-on-error: true
+
+      - name: "📍 Labor Pipeline"
+        if: ${{ needs.setup.outputs.run_labor == 'true' }}
+        run: python -m pipelines.pipeline_7_labor
+        continue-on-error: true
+
+      - name: "🎯 Calculate Scores"
+        if: ${{ needs.setup.outputs.run_scoring == 'true' }}
+        id: scoring
+        run: |
+          python << 'PYTHON_SCRIPT'
+          import json
+          from orchestration.scoring_engine import ScoringEngine
+          
+          engine = ScoringEngine()
+          results = engine.score_all_companies(limit=500)
+          
+          tiers = {'hot': 0, 'warm': 0, 'cool': 0, 'cold': 0}
+          for r in results:
+              tiers[r.tier] += 1
+          
+          print(f"Scored {len(results)} companies")
+          print(f"Hot: {tiers['hot']}, Warm: {tiers['warm']}")
+          
+          with open('results.json', 'w') as f:
+              json.dump({'total': len(results), **tiers}, f)
+          PYTHON_SCRIPT
+
+      - name: "Upload results"
+        uses: actions/upload-artifact@v4
+        with:
+          name: webhook-run-${{ github.run_id }}
+          path: "*.json"
+
+  # ==========================================
+  # OPTIONAL: EXPORT & NOTIFY
+  # ==========================================
+  notify:
+    name: "📧 Notify"
+    needs: [setup, pipelines]
+    runs-on: ubuntu-latest
+    if: ${{ needs.setup.outputs.send_email == 'true' }}
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      
+      - run: pip install resend supabase
+      
+      - name: "Send notification"
+        env:
+          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+          ALERT_EMAIL: ${{ secrets.ALERT_EMAIL }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          MIN_SCORE: ${{ needs.setup.outputs.min_score }}
+        run: |
+          python << 'PYTHON_SCRIPT'
+          import os
+          import resend
+          from supabase import create_client
+          
+          resend.api_key = os.environ['RESEND_API_KEY']
+          min_score = int(os.environ.get('MIN_SCORE', 75))
+          
+          supabase = create_client(os.environ['SUPABASE_URL'], os.environ['SUPABASE_KEY'])
+          response = supabase.table('signal_history').select('*').gte('propensity_score', min_score).execute()
+          
+          count = len(response.data)
+          if count == 0:
+              print("No leads above threshold")
+              exit(0)
+          
+          resend.Emails.send({
+              "from": "Propensity Engine <alerts@yourdomain.com>",
+              "to": [os.environ['ALERT_EMAIL']],
+              "subject": f"🔔 Webhook Run Complete: {count} leads found",
+              "html": f"<p>Pipeline run completed via webhook.</p><p><strong>{count}</strong> leads scored {min_score}+</p>"
+          })
+          print(f"Notification sent for {count} leads")
+          PYTHON_SCRIPT
