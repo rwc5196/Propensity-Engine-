@@ -1,10 +1,13 @@
+anced · YML
+Copy
+
 # ============================================================================
-# DAILY SCHEDULED PIPELINE RUN
+# DAILY SCHEDULED PIPELINE RUN - ENHANCED VERSION
 # ============================================================================
 # Runs every day at 6 AM Central Time (12:00 UTC)
 # Executes all 7 data pipelines
 # Calculates propensity scores
-# Exports hot leads to Google Sheets
+# Exports hot leads to Google Sheets WITH ALL ENHANCED FIELDS
 # Sends email alerts for new hot leads
 # ============================================================================
 
@@ -188,7 +191,7 @@ jobs:
           retention-days: 30
 
   # ==========================================
-  # JOB 2: EXPORT TO GOOGLE SHEETS
+  # JOB 2: EXPORT TO GOOGLE SHEETS (ENHANCED)
   # ==========================================
   export-sheets:
     name: "Export to Google Sheets"
@@ -218,7 +221,7 @@ jobs:
           SUPABASE_KEY=${{ secrets.SUPABASE_KEY }}
           EOF
 
-      - name: "Export hot leads to Sheets"
+      - name: "Export hot leads to Sheets (ENHANCED)"
         env:
           GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
         run: |
@@ -234,18 +237,33 @@ jobs:
           supabase_key = os.environ.get('SUPABASE_KEY') or '${{ secrets.SUPABASE_KEY }}'
           supabase = create_client(supabase_url, supabase_key)
 
-          # Fetch hot leads from view
+          # Fetch hot leads with company data via RPC or direct join query
+          # First try the enhanced query
           try:
-              response = supabase.table('hot_leads').select('*').execute()
+              # Get signal_history with company_master data
+              response = supabase.rpc('get_hot_leads_enhanced').execute()
               leads = response.data
           except Exception as e:
-              print(f"Could not fetch from hot_leads view: {e}")
-              # Try fetching from signal_history with high scores
+              print(f"RPC not available, using direct query: {e}")
+              # Fallback: fetch from both tables and merge
               try:
-                  response = supabase.table('signal_history').select('*').gte('propensity_score', 75).execute()
-                  leads = response.data
+                  sh_response = supabase.table('signal_history').select('*').eq('score_tier', 'hot').execute()
+                  cm_response = supabase.table('company_master').select('*').execute()
+                  
+                  # Create lookup dict for company data
+                  company_lookup = {c['id']: c for c in cm_response.data}
+                  
+                  # Merge data
+                  leads = []
+                  for sh in sh_response.data:
+                      company_id = sh.get('company_id')
+                      if company_id and company_id in company_lookup:
+                          merged = {**sh, **company_lookup[company_id]}
+                          leads.append(merged)
+                      else:
+                          leads.append(sh)
               except Exception as e2:
-                  print(f"Could not fetch from signal_history: {e2}")
+                  print(f"Error fetching data: {e2}")
                   leads = []
 
           if not leads:
@@ -271,45 +289,283 @@ jobs:
                   
               sheet = gc.open_by_key(sheet_id)
               
-              # Get or create worksheet
+              # ==========================================
+              # SHEET 1: HOT LEADS (ENHANCED)
+              # ==========================================
               try:
                   worksheet = sheet.worksheet('Hot Leads')
               except gspread.WorksheetNotFound:
-                  worksheet = sheet.add_worksheet('Hot Leads', rows=1000, cols=20)
+                  worksheet = sheet.add_worksheet('Hot Leads', rows=2000, cols=40)
               
-              # Clear and write headers
+              # ENHANCED HEADERS - All new fields
               headers = [
-                  'Company', 'City', 'State', 'Zip', 'Score', 'Tier',
-                  'Dominant Signal', 'Expansion', 'Distress', 'Jobs',
-                  'Sentiment', 'Market', 'Contact', 'Email', 'Last Updated'
+                  # Company Info
+                  'Company Name', 'City', 'State', 'Zip', 'Industry',
+                  # Scoring
+                  'Propensity Score', 'Score Tier', 'Dominant Signal', 'Priority Tier', 'Staffing Fit',
+                  # Signal Breakdown
+                  'Expansion', 'Distress', 'Job Velocity', 'Sentiment', 'Market Tightness',
+                  'Actively Hiring', 'Competitive Pressure', 'Seasonal',
+                  # Company Size
+                  'Est. Employees', 'Revenue', 'Revenue Raw',
+                  # Contact Info
+                  'Contact Name', 'Contact Title', 'Contact Email', 'Contact Phone', 'LinkedIn',
+                  # Competitive Intel
+                  'Current Vendor', 'Uses Staffing?', 'Est. Temp HC', 'Union Status', 'Seasonal Pattern',
+                  # Pain Points & Messaging
+                  'Primary Pain Point', 'Secondary Pain Point', 'Value Proposition', 'Email Template',
+                  # Recommended Services
+                  'Recommended Services',
+                  # Outreach Tracking
+                  'Outreach Status', 'Last Outreach', 'Outreach Count', 'Next Action',
+                  # Metadata
+                  'Website', 'Last Updated'
               ]
+              
               worksheet.clear()
               worksheet.append_row(headers)
               
-              # Write data
+              # Format revenue helper
+              def format_revenue(rev):
+                  if not rev:
+                      return ''
+                  try:
+                      rev = float(rev)
+                      if rev >= 1000000000:
+                          return f"${rev/1000000000:.1f}B"
+                      elif rev >= 1000000:
+                          return f"${rev/1000000:.1f}M"
+                      elif rev >= 1000:
+                          return f"${rev/1000:.0f}K"
+                      else:
+                          return f"${rev:.0f}"
+                  except:
+                      return ''
+              
+              # Write data rows
               rows = []
               for lead in leads:
                   rows.append([
+                      # Company Info
                       lead.get('company_name', ''),
                       lead.get('city', ''),
                       lead.get('state', ''),
                       lead.get('zip_code', ''),
+                      lead.get('industry', ''),
+                      # Scoring
                       lead.get('propensity_score', 0),
                       lead.get('score_tier', ''),
                       lead.get('dominant_signal', ''),
+                      lead.get('priority_tier', ''),
+                      lead.get('staffing_fit_score', ''),
+                      # Signal Breakdown
                       lead.get('expansion_score', 0),
                       lead.get('distress_score', 0),
                       lead.get('job_velocity_score', 0),
                       lead.get('sentiment_score', 0),
                       lead.get('market_tightness_score', 0),
+                      lead.get('actively_hiring_score', 0),
+                      lead.get('competitive_pressure_score', 0),
+                      lead.get('seasonal_timing_score', 0),
+                      # Company Size
+                      lead.get('employee_count_estimate', ''),
+                      format_revenue(lead.get('annual_revenue')),
+                      lead.get('annual_revenue', ''),
+                      # Contact Info
                       lead.get('primary_contact_name', ''),
+                      lead.get('primary_contact_title', ''),
                       lead.get('primary_contact_email', ''),
+                      lead.get('primary_contact_phone', ''),
+                      lead.get('primary_contact_linkedin', ''),
+                      # Competitive Intel
+                      lead.get('current_staffing_provider', ''),
+                      'Yes' if lead.get('uses_staffing_agencies') else '',
+                      lead.get('estimated_temp_headcount', ''),
+                      lead.get('union_status', ''),
+                      lead.get('seasonal_pattern', ''),
+                      # Pain Points & Messaging
+                      lead.get('primary_pain_point', ''),
+                      lead.get('secondary_pain_point', ''),
+                      lead.get('suggested_value_prop', ''),
+                      lead.get('suggested_email_template', ''),
+                      # Recommended Services
+                      lead.get('recommended_services', ''),
+                      # Outreach Tracking
+                      lead.get('outreach_status', 'Not Started'),
+                      lead.get('last_outreach_date', ''),
+                      lead.get('outreach_count', 0),
+                      lead.get('next_action', ''),
+                      # Metadata
+                      lead.get('website', ''),
                       datetime.now().strftime('%Y-%m-%d %H:%M')
                   ])
               
               if rows:
                   worksheet.append_rows(rows)
-              print(f"Exported {len(rows)} hot leads to Google Sheets")
+              print(f"Exported {len(rows)} hot leads to 'Hot Leads' sheet")
+              
+              # ==========================================
+              # SHEET 2: WARM LEADS
+              # ==========================================
+              try:
+                  # Fetch warm leads
+                  sh_warm = supabase.table('signal_history').select('*').eq('score_tier', 'warm').execute()
+                  cm_response = supabase.table('company_master').select('*').execute()
+                  company_lookup = {c['id']: c for c in cm_response.data}
+                  
+                  warm_leads = []
+                  for sh in sh_warm.data:
+                      company_id = sh.get('company_id')
+                      if company_id and company_id in company_lookup:
+                          merged = {**sh, **company_lookup[company_id]}
+                          warm_leads.append(merged)
+                  
+                  if warm_leads:
+                      try:
+                          warm_ws = sheet.worksheet('Warm Leads')
+                      except gspread.WorksheetNotFound:
+                          warm_ws = sheet.add_worksheet('Warm Leads', rows=2000, cols=20)
+                      
+                      warm_headers = [
+                          'Company Name', 'City', 'State', 'Industry',
+                          'Propensity Score', 'Dominant Signal', 'Priority Tier',
+                          'Est. Employees', 'Revenue',
+                          'Primary Pain Point', 'Email Template', 'Recommended Services',
+                          'Website', 'Last Updated'
+                      ]
+                      
+                      warm_ws.clear()
+                      warm_ws.append_row(warm_headers)
+                      
+                      warm_rows = []
+                      for lead in warm_leads[:500]:  # Limit to 500
+                          warm_rows.append([
+                              lead.get('company_name', ''),
+                              lead.get('city', ''),
+                              lead.get('state', ''),
+                              lead.get('industry', ''),
+                              lead.get('propensity_score', 0),
+                              lead.get('dominant_signal', ''),
+                              lead.get('priority_tier', ''),
+                              lead.get('employee_count_estimate', ''),
+                              format_revenue(lead.get('annual_revenue')),
+                              lead.get('primary_pain_point', ''),
+                              lead.get('suggested_email_template', ''),
+                              lead.get('recommended_services', ''),
+                              lead.get('website', ''),
+                              datetime.now().strftime('%Y-%m-%d %H:%M')
+                          ])
+                      
+                      if warm_rows:
+                          warm_ws.append_rows(warm_rows)
+                      print(f"Exported {len(warm_rows)} warm leads to 'Warm Leads' sheet")
+              except Exception as e:
+                  print(f"Warm leads export error: {e}")
+              
+              # ==========================================
+              # SHEET 3: DFW/TEXAS LEADS
+              # ==========================================
+              try:
+                  # Filter for Texas
+                  texas_leads = [l for l in leads if l.get('state') == 'TX']
+                  
+                  if texas_leads:
+                      try:
+                          tx_ws = sheet.worksheet('DFW Region')
+                      except gspread.WorksheetNotFound:
+                          tx_ws = sheet.add_worksheet('DFW Region', rows=500, cols=20)
+                      
+                      tx_headers = [
+                          'Company Name', 'City', 'Zip', 'Industry',
+                          'Propensity Score', 'Dominant Signal', 'Priority Tier',
+                          'Est. Employees', 'Revenue',
+                          'Primary Pain Point', 'Email Template',
+                          'Contact Name', 'Contact Email',
+                          'Website', 'Last Updated'
+                      ]
+                      
+                      tx_ws.clear()
+                      tx_ws.append_row(tx_headers)
+                      
+                      tx_rows = []
+                      for lead in texas_leads:
+                          tx_rows.append([
+                              lead.get('company_name', ''),
+                              lead.get('city', ''),
+                              lead.get('zip_code', ''),
+                              lead.get('industry', ''),
+                              lead.get('propensity_score', 0),
+                              lead.get('dominant_signal', ''),
+                              lead.get('priority_tier', ''),
+                              lead.get('employee_count_estimate', ''),
+                              format_revenue(lead.get('annual_revenue')),
+                              lead.get('primary_pain_point', ''),
+                              lead.get('suggested_email_template', ''),
+                              lead.get('primary_contact_name', ''),
+                              lead.get('primary_contact_email', ''),
+                              lead.get('website', ''),
+                              datetime.now().strftime('%Y-%m-%d %H:%M')
+                          ])
+                      
+                      if tx_rows:
+                          tx_ws.append_rows(tx_rows)
+                      print(f"Exported {len(tx_rows)} Texas leads to 'DFW Region' sheet")
+              except Exception as e:
+                  print(f"Texas leads export error: {e}")
+              
+              # ==========================================
+              # SHEET 4: SUMMARY DASHBOARD
+              # ==========================================
+              try:
+                  try:
+                      summary_ws = sheet.worksheet('Summary')
+                  except gspread.WorksheetNotFound:
+                      summary_ws = sheet.add_worksheet('Summary', rows=50, cols=10)
+                  
+                  # Get counts
+                  hot_count = len(leads)
+                  warm_count = len(warm_leads) if 'warm_leads' in dir() else 0
+                  tx_count = len(texas_leads) if 'texas_leads' in dir() else 0
+                  
+                  summary_ws.clear()
+                  summary_data = [
+                      ['PROPENSITY ENGINE DASHBOARD', '', datetime.now().strftime('%Y-%m-%d %H:%M')],
+                      [''],
+                      ['LEAD SUMMARY', ''],
+                      ['Hot Leads (75+)', hot_count],
+                      ['Warm Leads (50-74)', warm_count],
+                      ['Texas/DFW Leads', tx_count],
+                      [''],
+                      ['TOP INDUSTRIES', ''],
+                  ]
+                  
+                  # Count by industry
+                  industry_counts = {}
+                  for lead in leads:
+                      ind = lead.get('industry', 'Unknown')
+                      industry_counts[ind] = industry_counts.get(ind, 0) + 1
+                  
+                  for ind, count in sorted(industry_counts.items(), key=lambda x: -x[1])[:10]:
+                      summary_data.append([ind, count])
+                  
+                  summary_data.append([''])
+                  summary_data.append(['TOP STATES', ''])
+                  
+                  # Count by state
+                  state_counts = {}
+                  for lead in leads:
+                      st = lead.get('state', 'Unknown')
+                      state_counts[st] = state_counts.get(st, 0) + 1
+                  
+                  for st, count in sorted(state_counts.items(), key=lambda x: -x[1])[:10]:
+                      summary_data.append([st, count])
+                  
+                  for row in summary_data:
+                      summary_ws.append_row(row)
+                  
+                  print("Updated Summary dashboard")
+              except Exception as e:
+                  print(f"Summary export error: {e}")
               
           except Exception as e:
               print(f"Google Sheets export error: {e}")
@@ -359,27 +615,47 @@ jobs:
           
           resend.api_key = resend_key
           
-          # Fetch hot leads
+          # Fetch hot leads with company data
           supabase = create_client(
               os.environ['SUPABASE_URL'],
               os.environ['SUPABASE_KEY']
           )
           
           try:
-              response = supabase.table('hot_leads').select('*').limit(20).execute()
-              leads = response.data
-          except:
-              try:
-                  response = supabase.table('signal_history').select('*').gte('propensity_score', 75).limit(20).execute()
-                  leads = response.data
-              except:
-                  leads = []
+              sh_response = supabase.table('signal_history').select('*').eq('score_tier', 'hot').limit(25).execute()
+              cm_response = supabase.table('company_master').select('*').execute()
+              company_lookup = {c['id']: c for c in cm_response.data}
+              
+              leads = []
+              for sh in sh_response.data:
+                  company_id = sh.get('company_id')
+                  if company_id and company_id in company_lookup:
+                      merged = {**sh, **company_lookup[company_id]}
+                      leads.append(merged)
+          except Exception as e:
+              print(f"Error fetching leads: {e}")
+              leads = []
           
           if not leads:
               print("No hot leads - skipping email")
               exit(0)
           
-          # Build email HTML
+          # Format revenue helper
+          def format_revenue(rev):
+              if not rev:
+                  return 'N/A'
+              try:
+                  rev = float(rev)
+                  if rev >= 1000000000:
+                      return f"${rev/1000000000:.1f}B"
+                  elif rev >= 1000000:
+                      return f"${rev/1000000:.1f}M"
+                  else:
+                      return 'N/A'
+              except:
+                  return 'N/A'
+          
+          # Build enhanced email HTML
           rows_html = ""
           for lead in leads:
               rows_html += f"""
@@ -388,13 +664,15 @@ jobs:
                 <td style="padding: 8px; border-bottom: 1px solid #eee;">{lead.get('city', '')}, {lead.get('state', '')}</td>
                 <td style="padding: 8px; border-bottom: 1px solid #eee; font-weight: bold; color: #e74c3c;">{lead.get('propensity_score', 0)}</td>
                 <td style="padding: 8px; border-bottom: 1px solid #eee;">{lead.get('dominant_signal', 'N/A')}</td>
+                <td style="padding: 8px; border-bottom: 1px solid #eee;">{format_revenue(lead.get('annual_revenue'))}</td>
+                <td style="padding: 8px; border-bottom: 1px solid #eee;">{lead.get('suggested_email_template', 'N/A')}</td>
               </tr>
               """
           
           html = f"""
           <html>
-          <body style="font-family: Arial, sans-serif; max-width: 800px; margin: 0 auto;">
-            <h2 style="color: #2c3e50;">Hot Leads Detected - {len(leads)}</h2>
+          <body style="font-family: Arial, sans-serif; max-width: 900px; margin: 0 auto;">
+            <h2 style="color: #2c3e50;">🔥 Hot Leads Detected - {len(leads)}</h2>
             <p style="color: #7f8c8d;">Propensity Engine Daily Report - {datetime.now().strftime('%B %d, %Y')}</p>
             
             <table style="width: 100%; border-collapse: collapse; margin-top: 20px;">
@@ -403,7 +681,9 @@ jobs:
                   <th style="padding: 12px; text-align: left;">Company</th>
                   <th style="padding: 12px; text-align: left;">Location</th>
                   <th style="padding: 12px; text-align: left;">Score</th>
-                  <th style="padding: 12px; text-align: left;">Top Signal</th>
+                  <th style="padding: 12px; text-align: left;">Signal</th>
+                  <th style="padding: 12px; text-align: left;">Revenue</th>
+                  <th style="padding: 12px; text-align: left;">Template</th>
                 </tr>
               </thead>
               <tbody>
@@ -413,9 +693,13 @@ jobs:
             
             <p style="margin-top: 30px; padding: 15px; background: #f8f9fa; border-radius: 5px;">
               <strong>Next Steps:</strong><br>
-              1. Review leads in Supabase Dashboard<br>
-              2. Check Google Sheet for full details<br>
-              3. Generate outreach emails via the Sales Agent
+              1. Review full details in Google Sheets<br>
+              2. Use assigned Email Templates for outreach<br>
+              3. Track responses in Outreach Tracker
+            </p>
+            
+            <p style="color: #95a5a6; font-size: 12px;">
+              Enhanced report includes: Pain points, value propositions, contact fields, and recommended services.
             </p>
           </body>
           </html>
@@ -426,7 +710,7 @@ jobs:
               response = resend.Emails.send({
                   "from": "Propensity Engine <onboarding@resend.dev>",
                   "to": [alert_email],
-                  "subject": f"Hot Leads Alert - {len(leads)} leads found",
+                  "subject": f"🔥 Hot Leads Alert - {len(leads)} leads found",
                   "html": html
               })
               print(f"Email sent: {response}")
@@ -466,4 +750,13 @@ jobs:
           | Pipelines | ${{ needs.run-pipelines.result }} |
           | Sheets Export | ${{ needs.export-sheets.result }} |
           | Email Alerts | ${{ needs.send-alerts.result }} |
+          
+          ## Google Sheets
+          
+          | Sheet | Contents |
+          |-------|----------|
+          | Hot Leads | All fields + contact info + pain points |
+          | Warm Leads | Key fields for nurturing |
+          | DFW Region | Texas-only hot leads |
+          | Summary | Dashboard with counts by industry/state |
           EOF
