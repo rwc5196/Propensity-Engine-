@@ -168,7 +168,7 @@ jobs:
 
       - name: "🎯 Calculate Propensity Scores"
         id: scoring
-        run: |
+        run: python run_scoring.py
           python << 'PYTHON_SCRIPT'
           import json
           from orchestration.scoring_engine import ScoringEngine
