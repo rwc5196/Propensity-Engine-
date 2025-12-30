@@ -29,6 +29,9 @@ loguru>=0.7.0
 pydantic>=2.0.0
 pydantic-settings>=2.0.0
 
+# DNS
+dnspython>=2.4.0
+
 # Utilities
 beautifulsoup4>=4.12.0
 lxml>=4.9.0
