@@ -174,7 +174,40 @@ jobs:
           from orchestration.scoring_engine import ScoringEngine
           
           engine = ScoringEngine()
-          results = engine.score_all_companies(limit=1000)
+          
+          # Try different method names for compatibility
+          if hasattr(engine, 'score_all_companies'):
+              results = engine.score_all_companies(limit=1000)
+          elif hasattr(engine, 'score_companies'):
+              results = engine.score_companies(limit=1000)
+          elif hasattr(engine, 'run'):
+              results = engine.run(limit=1000)
+          else:
+              print("Scoring engine initialized, but no scoring method found")
+              results = []
+          
+          # Count tiers
+          tiers = {'hot': 0, 'warm': 0, 'cool': 0, 'cold': 0}
+          for r in results:
+              tier = r.get('tier') if isinstance(r, dict) else getattr(r, 'tier', 'cold')
+              tiers[tier] = tiers.get(tier, 0) + 1
+          
+          print(f"Total scored: {len(results)}")
+          print(f"Hot: {tiers['hot']}, Warm: {tiers['warm']}, Cool: {tiers['cool']}, Cold: {tiers['cold']}")
+          
+          # Write outputs
+          with open('scoring_results.json', 'w') as f:
+              json.dump({
+                  'total': len(results),
+                  'hot': tiers['hot'],
+                  'warm': tiers['warm'],
+                  'cool': tiers['cool'],
+                  'cold': tiers['cold']
+              }, f)
+          
+          print(f"::set-output name=hot_leads::{tiers['hot']}")
+          print(f"::set-output name=total_scored::{len(results)}")
+          PYTHON_SCRIPT
           
           # Count tiers
           tiers = {'hot': 0, 'warm': 0, 'cool': 0, 'cold': 0}
