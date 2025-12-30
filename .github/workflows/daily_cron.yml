@@ -1,0 +1,482 @@
+# ============================================================================
+# 🕐 DAILY SCHEDULED PIPELINE RUN
+# ============================================================================
+# COPY THIS FILE TO: .github/workflows/daily_cron.yml
+# 
+# WHAT IT DOES:
+# - Runs every day at 6 AM Central Time (12:00 UTC)
+# - Executes all 7 data pipelines
+# - Calculates propensity scores
+# - Exports hot leads to Google Sheets
+# - Sends email alerts for new hot leads
+#
+# REQUIRED SECRETS (add in GitHub → Settings → Secrets → Actions):
+# - SUPABASE_URL
+# - SUPABASE_KEY  
+# - GEMINI_API_KEY
+# - FRED_API_KEY
+# - RESEND_API_KEY (for email alerts)
+# - GOOGLE_SHEETS_CREDENTIALS (base64 encoded service account JSON)
+# - GOOGLE_SHEET_ID
+# ============================================================================
+
+name: "🕐 Daily Pipeline Run"
+
+on:
+  schedule:
+    # 6 AM Central = 12:00 UTC (handles DST automatically)
+    - cron: '0 12 * * *'
+  
+  # Allow manual trigger with same workflow
+  workflow_dispatch:
+
+env:
+  PYTHON_VERSION: '3.12'
+  TZ: 'America/Chicago'
+
+jobs:
+  # ==========================================
+  # JOB 1: RUN ALL PIPELINES
+  # ==========================================
+  run-pipelines:
+    name: "🔧 Execute Pipelines"
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    
+    outputs:
+      hot_leads_count: ${{ steps.scoring.outputs.hot_leads }}
+      total_scored: ${{ steps.scoring.outputs.total_scored }}
+      run_id: ${{ github.run_id }}
+    
+    steps:
+      - name: "📥 Checkout repository"
+        uses: actions/checkout@v4
+
+      - name: "🐍 Setup Python ${{ env.PYTHON_VERSION }}"
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+
+      - name: "📦 Install dependencies"
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: "🔐 Configure environment"
+        run: |
+          cat > .env << 'EOF'
+          # Database
+          SUPABASE_URL=${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY=${{ secrets.SUPABASE_KEY }}
+          
+          # AI
+          GEMINI_API_KEY=${{ secrets.GEMINI_API_KEY }}
+          GEMINI_FLASH_MODEL=gemini-3-flash-preview
+          GEMINI_PRO_MODEL=gemini-3-pro-preview
+          
+          # Data Sources
+          FRED_API_KEY=${{ secrets.FRED_API_KEY }}
+          BLS_API_KEY=${{ secrets.BLS_API_KEY }}
+          SEC_USER_AGENT=PropensityEngine github-actions@${{ github.repository }}
+          
+          # Geography - DFW Focus
+          TARGET_CITIES=Dallas,Fort Worth,Arlington,Irving,Plano,Garland,Grand Prairie,McKinney,Frisco,Denton
+          TARGET_STATE=TX
+          TARGET_ZIPS=75001,75006,75019,75038,75039,75050,75060,75061,75062,76001,76010,76011,76012,76102,76103,76104
+          
+          # Scoring Weights
+          WEIGHT_EXPANSION=0.25
+          WEIGHT_DISTRESS=0.20
+          WEIGHT_JOB_VELOCITY=0.20
+          WEIGHT_SENTIMENT=0.15
+          WEIGHT_MARKET_TIGHTNESS=0.10
+          WEIGHT_MACRO=0.10
+          
+          # Thresholds
+          HOT_LEAD_THRESHOLD=75
+          MIN_PERMIT_VALUE=50000
+          PERMIT_LOOKBACK_DAYS=30
+          EOF
+
+      - name: "🏗️ Pipeline 1: Building Permits"
+        id: permits
+        continue-on-error: true
+        run: |
+          echo "::group::Pipeline 1 Output"
+          python -m pipelines.pipeline_1_permits 2>&1 | tee pipeline1.log
+          echo "::endgroup::"
+          echo "status=$?" >> $GITHUB_OUTPUT
+
+      - name: "⚠️ Pipeline 2: WARN Notices"
+        id: warn
+        continue-on-error: true
+        run: |
+          echo "::group::Pipeline 2 Output"
+          python -m pipelines.pipeline_2_warn 2>&1 | tee pipeline2.log
+          echo "::endgroup::"
+
+      - name: "📈 Pipeline 3: Economic Indicators"
+        id: macro
+        continue-on-error: true
+        run: |
+          echo "::group::Pipeline 3 Output"
+          python -m pipelines.pipeline_3_macro 2>&1 | tee pipeline3.log
+          echo "::endgroup::"
+
+      - name: "⭐ Pipeline 4: Glassdoor Sentiment"
+        id: glassdoor
+        continue-on-error: true
+        run: |
+          echo "::group::Pipeline 4 Output"
+          # Rate limited - only process sample
+          python -c "
+          from pipelines import GlassdoorPipeline
+          p = GlassdoorPipeline()
+          p.run(['Amazon', 'XPO Logistics', 'FedEx', 'UPS', 'DHL'])
+          " 2>&1 | tee pipeline4.log
+          echo "::endgroup::"
+
+      - name: "💼 Pipeline 5: Job Postings"
+        id: jobs
+        continue-on-error: true
+        run: |
+          echo "::group::Pipeline 5 Output"
+          python -m pipelines.pipeline_5_jobs 2>&1 | tee pipeline5.log
+          echo "::endgroup::"
+
+      - name: "📦 Pipeline 6: Inventory Turnover"
+        id: inventory
+        continue-on-error: true
+        run: |
+          echo "::group::Pipeline 6 Output"
+          python -c "
+          from pipelines import InventoryPipeline
+          p = InventoryPipeline()
+          # DFW-area retailers with warehouses
+          p.run(['WMT', 'HD', 'TGT', 'COST', 'KR', 'LOW', 'BBY', 'DG', 'DLTR'])
+          " 2>&1 | tee pipeline6.log
+          echo "::endgroup::"
+
+      - name: "📍 Pipeline 7: Labor Market"
+        id: labor
+        continue-on-error: true
+        run: |
+          echo "::group::Pipeline 7 Output"
+          python -m pipelines.pipeline_7_labor 2>&1 | tee pipeline7.log
+          echo "::endgroup::"
+
+      - name: "🎯 Calculate Propensity Scores"
+        id: scoring
+        run: |
+          python << 'PYTHON_SCRIPT'
+          import json
+          from orchestration.scoring_engine import ScoringEngine
+          
+          engine = ScoringEngine()
+          results = engine.score_all_companies(limit=1000)
+          
+          # Count tiers
+          tiers = {'hot': 0, 'warm': 0, 'cool': 0, 'cold': 0}
+          for r in results:
+              tiers[r.tier] = tiers.get(r.tier, 0) + 1
+          
+          print(f"Total scored: {len(results)}")
+          print(f"Hot: {tiers['hot']}, Warm: {tiers['warm']}, Cool: {tiers['cool']}, Cold: {tiers['cold']}")
+          
+          # Write outputs for next jobs
+          with open('scoring_results.json', 'w') as f:
+              json.dump({
+                  'total': len(results),
+                  'hot': tiers['hot'],
+                  'warm': tiers['warm'],
+                  'cool': tiers['cool'],
+                  'cold': tiers['cold']
+              }, f)
+          
+          # GitHub Actions outputs
+          print(f"::set-output name=hot_leads::{tiers['hot']}")
+          print(f"::set-output name=total_scored::{len(results)}")
+          PYTHON_SCRIPT
+
+      - name: "📊 Generate Run Report"
+        run: |
+          cat > run_report.json << EOF
+          {
+            "run_id": "${{ github.run_id }}",
+            "run_date": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "trigger": "${{ github.event_name }}",
+            "pipelines": {
+              "permits": "${{ steps.permits.outcome }}",
+              "warn": "${{ steps.warn.outcome }}",
+              "macro": "${{ steps.macro.outcome }}",
+              "glassdoor": "${{ steps.glassdoor.outcome }}",
+              "jobs": "${{ steps.jobs.outcome }}",
+              "inventory": "${{ steps.inventory.outcome }}",
+              "labor": "${{ steps.labor.outcome }}"
+            }
+          }
+          EOF
+          cat run_report.json
+
+      - name: "💾 Upload artifacts"
+        uses: actions/upload-artifact@v4
+        with:
+          name: pipeline-logs-${{ github.run_id }}
+          path: |
+            *.log
+            *.json
+          retention-days: 30
+
+  # ==========================================
+  # JOB 2: EXPORT TO GOOGLE SHEETS
+  # ==========================================
+  export-sheets:
+    name: "📊 Export to Google Sheets"
+    needs: run-pipelines
+    runs-on: ubuntu-latest
+    if: ${{ needs.run-pipelines.outputs.hot_leads_count > 0 }}
+    
+    steps:
+      - name: "📥 Checkout"
+        uses: actions/checkout@v4
+
+      - name: "🐍 Setup Python"
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+
+      - name: "📦 Install dependencies"
+        run: |
+          pip install gspread google-auth supabase
+
+      - name: "🔐 Setup credentials"
+        run: |
+          echo '${{ secrets.GOOGLE_SHEETS_CREDENTIALS }}' | base64 -d > credentials.json
+          cat > .env << EOF
+          SUPABASE_URL=${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY=${{ secrets.SUPABASE_KEY }}
+          EOF
+
+      - name: "📤 Export hot leads to Sheets"
+        env:
+          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
+        run: |
+          python << 'PYTHON_SCRIPT'
+          import os
+          import gspread
+          from google.oauth2.service_account import Credentials
+          from supabase import create_client
+          from datetime import datetime
+          
+          # Connect to Supabase
+          supabase = create_client(
+              os.environ['SUPABASE_URL'],
+              os.environ['SUPABASE_KEY']
+          )
+          
+          # Fetch hot leads
+          response = supabase.table('hot_leads').select('*').execute()
+          leads = response.data
+          
+          if not leads:
+              print("No hot leads to export")
+              exit(0)
+          
+          # Connect to Google Sheets
+          scopes = [
+              'https://www.googleapis.com/auth/spreadsheets',
+              'https://www.googleapis.com/auth/drive'
+          ]
+          creds = Credentials.from_service_account_file('credentials.json', scopes=scopes)
+          gc = gspread.authorize(creds)
+          
+          # Open sheet
+          sheet = gc.open_by_key(os.environ['GOOGLE_SHEET_ID'])
+          
+          # Get or create "Hot Leads" worksheet
+          try:
+              worksheet = sheet.worksheet('Hot Leads')
+          except gspread.WorksheetNotFound:
+              worksheet = sheet.add_worksheet('Hot Leads', rows=1000, cols=20)
+          
+          # Clear and write headers
+          headers = [
+              'Company', 'City', 'State', 'Zip', 'Score', 'Tier',
+              'Dominant Signal', 'Expansion', 'Distress', 'Jobs',
+              'Sentiment', 'Market', 'Contact', 'Email', 'Last Updated'
+          ]
+          worksheet.clear()
+          worksheet.append_row(headers)
+          
+          # Write data
+          rows = []
+          for lead in leads:
+              rows.append([
+                  lead.get('company_name', ''),
+                  lead.get('city', ''),
+                  lead.get('state', ''),
+                  lead.get('zip_code', ''),
+                  lead.get('propensity_score', 0),
+                  lead.get('score_tier', ''),
+                  lead.get('dominant_signal', ''),
+                  lead.get('expansion_score', 0),
+                  lead.get('distress_score', 0),
+                  lead.get('job_velocity_score', 0),
+                  lead.get('sentiment_score', 0),
+                  lead.get('market_tightness_score', 0),
+                  lead.get('primary_contact_name', ''),
+                  lead.get('primary_contact_email', ''),
+                  datetime.now().strftime('%Y-%m-%d %H:%M')
+              ])
+          
+          worksheet.append_rows(rows)
+          print(f"Exported {len(rows)} hot leads to Google Sheets")
+          PYTHON_SCRIPT
+
+  # ==========================================
+  # JOB 3: SEND EMAIL ALERTS
+  # ==========================================
+  send-alerts:
+    name: "📧 Send Email Alerts"
+    needs: run-pipelines
+    runs-on: ubuntu-latest
+    if: ${{ needs.run-pipelines.outputs.hot_leads_count > 0 }}
+    
+    steps:
+      - name: "📥 Checkout"
+        uses: actions/checkout@v4
+
+      - name: "🐍 Setup Python"
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: "📦 Install dependencies"
+        run: pip install resend supabase
+
+      - name: "📧 Send hot leads alert"
+        env:
+          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+          ALERT_EMAIL: ${{ secrets.ALERT_EMAIL }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+        run: |
+          python << 'PYTHON_SCRIPT'
+          import os
+          import resend
+          from supabase import create_client
+          from datetime import datetime
+          
+          resend.api_key = os.environ['RESEND_API_KEY']
+          
+          # Fetch hot leads
+          supabase = create_client(
+              os.environ['SUPABASE_URL'],
+              os.environ['SUPABASE_KEY']
+          )
+          response = supabase.table('hot_leads').select('*').limit(20).execute()
+          leads = response.data
+          
+          if not leads:
+              print("No hot leads - skipping email")
+              exit(0)
+          
+          # Build email HTML
+          rows_html = ""
+          for lead in leads:
+              rows_html += f"""
+              <tr>
+                <td style="padding: 8px; border-bottom: 1px solid #eee;">{lead.get('company_name', 'N/A')}</td>
+                <td style="padding: 8px; border-bottom: 1px solid #eee;">{lead.get('city', '')}, {lead.get('state', '')}</td>
+                <td style="padding: 8px; border-bottom: 1px solid #eee; font-weight: bold; color: #e74c3c;">{lead.get('propensity_score', 0)}</td>
+                <td style="padding: 8px; border-bottom: 1px solid #eee;">{lead.get('dominant_signal', 'N/A')}</td>
+              </tr>
+              """
+          
+          html = f"""
+          <html>
+          <body style="font-family: Arial, sans-serif; max-width: 800px; margin: 0 auto;">
+            <h2 style="color: #2c3e50;">🔥 {len(leads)} Hot Leads Detected</h2>
+            <p style="color: #7f8c8d;">Propensity Engine Daily Report - {datetime.now().strftime('%B %d, %Y')}</p>
+            
+            <table style="width: 100%; border-collapse: collapse; margin-top: 20px;">
+              <thead>
+                <tr style="background: #3498db; color: white;">
+                  <th style="padding: 12px; text-align: left;">Company</th>
+                  <th style="padding: 12px; text-align: left;">Location</th>
+                  <th style="padding: 12px; text-align: left;">Score</th>
+                  <th style="padding: 12px; text-align: left;">Top Signal</th>
+                </tr>
+              </thead>
+              <tbody>
+                {rows_html}
+              </tbody>
+            </table>
+            
+            <p style="margin-top: 30px; padding: 15px; background: #f8f9fa; border-radius: 5px;">
+              <strong>Next Steps:</strong><br>
+              1. Review leads in <a href="https://supabase.com">Supabase Dashboard</a><br>
+              2. Check <a href="https://docs.google.com/spreadsheets/d/{os.environ.get('GOOGLE_SHEET_ID', '')}">Google Sheet</a> for full details<br>
+              3. Generate outreach emails via the Sales Agent
+            </p>
+            
+            <p style="color: #95a5a6; font-size: 12px; margin-top: 30px;">
+              Run ID: ${{ github.run_id }} | 
+              <a href="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}">View Run Logs</a>
+            </p>
+          </body>
+          </html>
+          """
+          
+          # Send email
+          response = resend.Emails.send({
+              "from": "Propensity Engine <alerts@yourdomain.com>",
+              "to": [os.environ['ALERT_EMAIL']],
+              "subject": f"🔥 {len(leads)} Hot Leads - Propensity Engine Alert",
+              "html": html
+          })
+          
+          print(f"Email sent: {response}")
+          PYTHON_SCRIPT
+
+  # ==========================================
+  # JOB 4: UPDATE SUMMARY
+  # ==========================================
+  summary:
+    name: "📝 Generate Summary"
+    needs: [run-pipelines, export-sheets, send-alerts]
+    runs-on: ubuntu-latest
+    if: always()
+    
+    steps:
+      - name: "📝 Write job summary"
+        run: |
+          cat >> $GITHUB_STEP_SUMMARY << 'EOF'
+          # 🎯 Propensity Engine Daily Run
+          
+          **Date:** $(date '+%Y-%m-%d %H:%M %Z')
+          **Run ID:** ${{ github.run_id }}
+          
+          ## 📊 Results
+          
+          | Metric | Value |
+          |--------|-------|
+          | Companies Scored | ${{ needs.run-pipelines.outputs.total_scored }} |
+          | Hot Leads | ${{ needs.run-pipelines.outputs.hot_leads_count }} |
+          
+          ## 🔧 Pipeline Status
+          
+          | Pipeline | Status |
+          |----------|--------|
+          | Pipelines | ${{ needs.run-pipelines.result }} |
+          | Sheets Export | ${{ needs.export-sheets.result }} |
+          | Email Alerts | ${{ needs.send-alerts.result }} |
+          
+          ## 📎 Links
+          
+          - [Supabase Dashboard](https://supabase.com/dashboard)
+          - [Google Sheet](https://docs.google.com/spreadsheets)
+          - [Looker Studio Dashboard](https://lookerstudio.google.com)
+          EOF
