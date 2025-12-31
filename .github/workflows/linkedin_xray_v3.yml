@@ -1,0 +1,52 @@
+name: "LinkedIn X-Ray Search v3"
+
+on:
+  workflow_dispatch:
+    inputs:
+      limit:
+        description: 'Number of NEW companies to search'
+        required: true
+        default: '15'
+        type: choice
+        options:
+          - '10'
+          - '15'
+          - '20'
+          - '25'
+
+jobs:
+  xray-search-v3:
+    name: "Progressive Contact Enrichment"
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: "Checkout"
+        uses: actions/checkout@v4
+
+      - name: "Setup Python"
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: "Install dependencies"
+        run: pip install requests supabase
+
+      - name: "Run Progressive Enrichment"
+        env:
+          SERPAPI_KEY: ${{ secrets.SERPAPI_KEY }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+        run: |
+          python scripts/linkedin_xray_search_v3.py --auto ${{ inputs.limit }}
+
+      - name: "Write Summary"
+        run: |
+          echo "## LinkedIn X-Ray Search v3 Complete" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Strategy:** Progressive Enrichment" >> $GITHUB_STEP_SUMMARY
+          echo "- Phase 1: Companies with NO contacts" >> $GITHUB_STEP_SUMMARY
+          echo "- Phase 2: Upgrade wrong contact types" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Processed:** ${{ inputs.limit }} NEW companies" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Run again to process the next batch!" >> $GITHUB_STEP_SUMMARY
