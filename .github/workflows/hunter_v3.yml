@@ -1,4 +1,4 @@
-name: "Hunter Enrichment v2"
+name: "Hunter Enrichment v3"
 
 on:
   workflow_dispatch:
@@ -6,13 +6,13 @@ on:
       limit:
         description: 'Number of companies to enrich'
         required: true
-        default: '40'
+        default: '10'
         type: choice
         options:
+          - '5'
           - '10'
           - '20'
           - '30'
-          - '40'
 
 jobs:
   hunter-enrichment:
@@ -31,7 +31,7 @@ jobs:
       - name: "Install dependencies"
         run: pip install requests supabase
 
-      - name: "Run Hunter Enrichment v2"
+      - name: "Run Hunter Enrichment v3"
         env:
           HUNTER_API_KEY: ${{ secrets.HUNTER_API_KEY }}
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
@@ -48,7 +48,7 @@ jobs:
 
           HUNTER_API_KEY = os.environ['HUNTER_API_KEY']
           supabase = create_client(os.environ['SUPABASE_URL'], os.environ['SUPABASE_KEY'])
-          LIMIT = int(os.environ.get('LIMIT', '40'))
+          LIMIT = int(os.environ.get('LIMIT', '10'))
 
           PRIORITY_1 = ['procurement', 'purchasing', 'sourcing', 'vendor']
           PRIORITY_2 = ['plant manager', 'facility manager', 'site manager', 'warehouse manager']
@@ -74,28 +74,45 @@ jobs:
               except:
                   return 0
 
-          def validate_domain(domain):
-              if not domain:
+          def validate_domain(website):
+              """Extract and validate domain from website URL."""
+              if not website:
                   return None
-              domain = domain.lower().strip()
+              
+              domain = website.lower().strip()
               domain = domain.replace('https://', '').replace('http://', '').replace('www.', '')
               domain = domain.split('/')[0].split('?')[0]
+              
               if '.' not in domain:
                   return None
               if re.match(r'^\d+\.\d+\.\d+\.\d+', domain):
                   return None
+              
               invalid = ['facebook.com', 'linkedin.com', 'twitter.com', 'instagram.com', 'youtube.com', 
                         'google.com', 'amazon.com', 'indeed.com', 'glassdoor.com', 'yelp.com', 'bbb.org']
               if domain in invalid:
                   return None
+              
               return domain
 
           def domain_search(domain):
+              """Search Hunter.io for email pattern."""
               try:
-                  r = requests.get("https://api.hunter.io/v2/domain-search",
-                      params={"domain": domain, "api_key": HUNTER_API_KEY, "limit": 20}, timeout=20)
+                  r = requests.get(
+                      "https://api.hunter.io/v2/domain-search",
+                      params={"domain": domain, "api_key": HUNTER_API_KEY, "limit": 20},
+                      timeout=30
+                  )
+                  
+                  if r.status_code == 400:
+                      return {"error": "Domain not found or invalid"}
+                  if r.status_code == 401:
+                      return {"error": "Invalid API key"}
+                  if r.status_code == 429:
+                      return {"error": "Rate limited"}
                   if r.status_code != 200:
                       return {"error": f"HTTP {r.status_code}"}
+                  
                   data = r.json().get('data', {})
                   contacts = []
                   for e in data.get('emails', []):
@@ -109,6 +126,8 @@ jobs:
                               "linkedin": e.get('linkedin'),
                           })
                   return {"success": True, "pattern": data.get('pattern'), "contacts": contacts}
+              except requests.exceptions.Timeout:
+                  return {"error": "Timeout"}
               except Exception as e:
                   return {"error": str(e)}
 
@@ -147,16 +166,65 @@ jobs:
               return None, 0
 
           def get_companies_to_enrich(limit):
+              """
+              FIXED: Get companies in correct priority order.
+              Key fix: Don't limit in Supabase query - get all, sort in Python, THEN limit.
+              """
               try:
-                  sh = supabase.table('signal_history').select('company_id, priority_rank').eq('score_tier', 'hot').order('priority_rank').limit(500).execute()
-                  company_ids = [s['company_id'] for s in sh.data]
-                  cm = supabase.table('company_master').select('id, company_name, website, city, state').in_('id', company_ids).not_.is_('website', 'null').is_('hunter_email_pattern', 'null').limit(limit * 2).execute()
+                  # Step 1: Get ALL hot leads with priority
+                  sh = supabase.table('signal_history').select(
+                      'company_id, priority_rank'
+                  ).eq('score_tier', 'hot').order('priority_rank').limit(500).execute()
+                  
+                  if not sh.data:
+                      print("No hot leads found in signal_history")
+                      return []
+                  
+                  # Create priority lookup
                   priority_lookup = {s['company_id']: s['priority_rank'] for s in sh.data}
-                  results = [{**c, 'rank': priority_lookup.get(c['id'], 999)} for c in cm.data]
-                  results.sort(key=lambda x: x['rank'])
-                  return results[:limit]
+                  company_ids = list(priority_lookup.keys())
+                  
+                  print(f"Found {len(company_ids)} hot leads")
+                  print(f"Top 5 priority IDs: {company_ids[:5]}")
+                  
+                  # Step 2: Get company details - NO LIMIT here!
+                  cm = supabase.table('company_master').select(
+                      'id, company_name, website'
+                  ).in_('id', company_ids).not_.is_(
+                      'website', 'null'
+                  ).is_(
+                      'hunter_email_pattern', 'null'
+                  ).is_(
+                      'hunter_lookup_date', 'null'
+                  ).execute()  # NO LIMIT - get all matching companies
+                  
+                  print(f"Found {len(cm.data)} companies needing enrichment")
+                  
+                  if not cm.data:
+                      return []
+                  
+                  # Step 3: Add priority rank and sort
+                  results = []
+                  for c in cm.data:
+                      rank = priority_lookup.get(c['id'], 9999)
+                      results.append({**c, 'priority_rank': rank})
+                  
+                  # Sort by priority (lowest rank = highest priority)
+                  results.sort(key=lambda x: x['priority_rank'])
+                  
+                  # Step 4: NOW apply limit
+                  final = results[:limit]
+                  
+                  print(f"Selected top {len(final)} companies:")
+                  for i, c in enumerate(final[:5], 1):
+                      print(f"  {i}. {c['company_name']} (rank {c['priority_rank']})")
+                  
+                  return final
+                  
               except Exception as e:
                   print(f"Database error: {e}")
+                  import traceback
+                  traceback.print_exc()
                   return []
 
           def save_enrichment(company_id, pattern, contact, contact_score):
@@ -178,14 +246,23 @@ jobs:
                   print(f"Save error: {e}")
                   return False
 
-          def mark_searched(company_id):
+          def mark_failed(company_id, error):
+              """Mark company as searched even if failed."""
               try:
-                  supabase.table('company_master').update({'hunter_lookup_date': datetime.now().isoformat()}).eq('id', company_id).execute()
+                  supabase.table('company_master').update({
+                      'hunter_lookup_date': datetime.now().isoformat(),
+                  }).eq('id', company_id).execute()
               except:
                   pass
 
+          # =============================================================
+          # MAIN EXECUTION
+          # =============================================================
+          
           print("=" * 70)
-          print("HUNTER.IO ENRICHMENT v2 - OPTIMIZED")
+          print("HUNTER.IO ENRICHMENT v3 - FIXED PRIORITY SELECTION")
+          print("=" * 70)
+          print("Key fix: Sort by priority BEFORE limiting results")
           print("=" * 70)
 
           credits = check_credits()
@@ -200,31 +277,31 @@ jobs:
           print(f"📋 Will process: {actual_limit} companies\n")
 
           companies = get_companies_to_enrich(actual_limit)
+          
           if not companies:
               print("⚠️ No companies found needing enrichment")
               exit(0)
 
-          print(f"Found {len(companies)} companies to enrich\n")
+          print(f"\n{'=' * 70}")
+          print("PROCESSING")
+          print("=" * 70)
 
-          processed, patterns_found, good_contacts, bad_domains = 0, 0, 0, 0
+          processed, patterns_found, good_contacts, errors = 0, 0, 0, 0
 
           for i, co in enumerate(companies, 1):
-              if processed >= actual_limit:
-                  break
               company_id = co['id']
               name = co['company_name']
               website = co.get('website', '')
-              city = co.get('city', '')
-              state = co.get('state', '')
+              rank = co.get('priority_rank', '?')
 
               domain = validate_domain(website)
               if not domain:
-                  print(f"  {i}. {name} - ⚠️ Invalid domain")
-                  mark_searched(company_id)
-                  bad_domains += 1
+                  print(f"  {i}. {name} (rank {rank}) - ⚠️ Invalid domain: {website}")
+                  mark_failed(company_id, "Invalid domain")
                   continue
 
-              print(f"  {i}. {name} ({domain})")
+              print(f"  {i}. {name} (rank {rank}) - {domain}")
+              
               result = domain_search(domain)
               processed += 1
 
@@ -235,32 +312,36 @@ jobs:
                       best_contact, score = find_best_contact(result.get('contacts', []))
                       if best_contact and score >= 70:
                           tier = "T1" if score >= 90 else "T2"
-                          print(f"      ✓ Pattern: {pattern} | {tier}: {best_contact['name']}")
+                          print(f"      ✅ Pattern: {pattern} | {tier}: {best_contact['name']}")
                           good_contacts += 1
                       else:
-                          print(f"      ✓ Pattern: {pattern} | No relevant contact")
+                          print(f"      ✅ Pattern: {pattern} | No relevant contact")
                       save_enrichment(company_id, pattern, best_contact, score)
                   else:
-                      print(f"      ✗ No pattern found")
-                      mark_searched(company_id)
+                      print(f"      ⚠️ No pattern found")
+                      mark_failed(company_id, "No pattern")
               else:
-                  print(f"      ✗ Error: {result.get('error', 'Unknown')}")
-                  mark_searched(company_id)
+                  error = result.get('error', 'Unknown')
+                  print(f"      ❌ Error: {error}")
+                  mark_failed(company_id, error)
+                  errors += 1
 
-              time.sleep(1)
+              time.sleep(1.5)  # Rate limiting
 
           print(f"\n{'=' * 70}")
           print("SUMMARY")
           print("=" * 70)
           print(f"  Processed: {processed}")
           print(f"  Patterns found: {patterns_found}")
-          print(f"  Good contacts: {good_contacts}")
-          print(f"  Need X-Ray: {patterns_found - good_contacts}")
+          print(f"  Good contacts (T1/T2): {good_contacts}")
+          print(f"  Errors: {errors}")
           print(f"  Credits remaining: {check_credits()}")
           PYTHONEOF
 
       - name: "Write Summary"
         run: |
-          echo "## Hunter.io Enrichment v2 Complete" >> $GITHUB_STEP_SUMMARY
+          echo "## Hunter.io Enrichment v3 Complete" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Key Fix:** Priority selection now works correctly" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "**Next Step:** Run X-Ray v3 to find contacts" >> $GITHUB_STEP_SUMMARY
