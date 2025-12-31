@@ -36,6 +36,7 @@ jobs:
           HUNTER_API_KEY: ${{ secrets.HUNTER_API_KEY }}
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          LIMIT: ${{ inputs.limit }}
         run: |
           python << 'PYTHONEOF'
           import os
@@ -44,25 +45,16 @@ jobs:
           import requests
           from datetime import datetime
           from supabase import create_client
-          from urllib.parse import urlparse
 
-          # =============================================================
-          # CONFIGURATION
-          # =============================================================
-          
           HUNTER_API_KEY = os.environ['HUNTER_API_KEY']
           supabase = create_client(os.environ['SUPABASE_URL'], os.environ['SUPABASE_KEY'])
-          
           LIMIT = int(os.environ.get('LIMIT', '40'))
-          
-          # Contact prioritization - STRICT targeting
-          # Only save contacts with these titles
+
           PRIORITY_1 = ['procurement', 'purchasing', 'sourcing', 'vendor']
           PRIORITY_2 = ['plant manager', 'facility manager', 'site manager', 'warehouse manager']
           PRIORITY_3 = ['operations manager', 'operations director', 'production manager', 'manufacturing manager']
           PRIORITY_4 = ['hr director', 'human resources director', 'talent acquisition']
-          
-          # Titles to EXCLUDE - never save these
+
           EXCLUDE_TITLES = [
               'marketing', 'sales', 'account', 'business development',
               'finance', 'financial', 'accounting', 'controller',
@@ -74,86 +66,37 @@ jobs:
               'platform', 'product manager', 'product director',
               'consultant', 'advisory', 'intern', 'assistant', 'coordinator',
           ]
-          
-          # =============================================================
-          # HELPER FUNCTIONS
-          # =============================================================
-          
+
           def check_credits():
-              """Check remaining Hunter credits (FREE - no credit cost)."""
               try:
-                  r = requests.get(
-                      "https://api.hunter.io/v2/account",
-                      params={"api_key": HUNTER_API_KEY},
-                      timeout=10
-                  )
-                  data = r.json().get('data', {})
-                  return data.get('requests', {}).get('searches', {}).get('available', 0)
+                  r = requests.get("https://api.hunter.io/v2/account", params={"api_key": HUNTER_API_KEY}, timeout=10)
+                  return r.json().get('data', {}).get('requests', {}).get('searches', {}).get('available', 0)
               except:
                   return 0
-          
+
           def validate_domain(domain):
-              """
-              Validate domain before wasting a credit.
-              Returns cleaned domain or None if invalid.
-              """
               if not domain:
                   return None
-              
-              # Remove common issues
               domain = domain.lower().strip()
-              domain = domain.replace('https://', '').replace('http://', '')
-              domain = domain.replace('www.', '')
-              domain = domain.split('/')[0]  # Remove paths
-              domain = domain.split('?')[0]  # Remove query strings
-              
-              # Must have a TLD
+              domain = domain.replace('https://', '').replace('http://', '').replace('www.', '')
+              domain = domain.split('/')[0].split('?')[0]
               if '.' not in domain:
                   return None
-              
-              # Must not be an IP address
               if re.match(r'^\d+\.\d+\.\d+\.\d+', domain):
                   return None
-              
-              # Must not be a common invalid domain
-              invalid_domains = [
-                  'facebook.com', 'linkedin.com', 'twitter.com', 'instagram.com',
-                  'youtube.com', 'google.com', 'amazon.com', 'indeed.com',
-                  'glassdoor.com', 'yelp.com', 'bbb.org', 'wikipedia.org',
-              ]
-              if domain in invalid_domains:
+              invalid = ['facebook.com', 'linkedin.com', 'twitter.com', 'instagram.com', 'youtube.com', 
+                        'google.com', 'amazon.com', 'indeed.com', 'glassdoor.com', 'yelp.com', 'bbb.org']
+              if domain in invalid:
                   return None
-              
-              # Basic format check
-              if not re.match(r'^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z]{2,})+$', domain):
-                  # Allow some flexibility
-                  if not re.match(r'^[\w.-]+\.\w{2,}$', domain):
-                      return None
-              
               return domain
-          
+
           def domain_search(domain):
-              """
-              Search domain for email pattern and contacts.
-              Requests MORE contacts (limit=20) to find better matches.
-              """
               try:
-                  r = requests.get(
-                      "https://api.hunter.io/v2/domain-search",
-                      params={
-                          "domain": domain,
-                          "api_key": HUNTER_API_KEY,
-                          "limit": 20,  # Request more contacts
-                      },
-                      timeout=20
-                  )
-                  
+                  r = requests.get("https://api.hunter.io/v2/domain-search",
+                      params={"domain": domain, "api_key": HUNTER_API_KEY, "limit": 20}, timeout=20)
                   if r.status_code != 200:
                       return {"error": f"HTTP {r.status_code}"}
-                  
                   data = r.json().get('data', {})
-                  
-                  # Parse all contacts
                   contacts = []
                   for e in data.get('emails', []):
                       if e.get('first_name') and e.get('last_name'):
@@ -164,136 +107,61 @@ jobs:
                               "confidence": e.get('confidence', 0),
                               "phone": e.get('phone_number'),
                               "linkedin": e.get('linkedin'),
-                              "department": e.get('department'),
                           })
-                  
-                  return {
-                      "success": True,
-                      "pattern": data.get('pattern'),
-                      "organization": data.get('organization'),
-                      "contacts": contacts,
-                      "total_emails": data.get('emails', []),
-                  }
-                  
-              except requests.exceptions.Timeout:
-                  return {"error": "Timeout"}
+                  return {"success": True, "pattern": data.get('pattern'), "contacts": contacts}
               except Exception as e:
                   return {"error": str(e)}
-          
+
           def score_contact(position):
-              """
-              Score a contact based on title relevance.
-              Higher = better. Returns -1 for excluded titles.
-              """
               if not position:
                   return 0
-              
               pos_lower = position.lower()
-              
-              # Check exclusions first
               for exclude in EXCLUDE_TITLES:
                   if exclude.lower() in pos_lower:
                       return -1
-              
-              # Priority 1: Procurement (100 points)
               for kw in PRIORITY_1:
                   if kw in pos_lower:
                       return 100
-              
-              # Priority 2: Plant/Facility (90 points)
               for kw in PRIORITY_2:
                   if kw in pos_lower:
                       return 90
-              
-              # Priority 3: Operations (80 points)
               for kw in PRIORITY_3:
                   if kw in pos_lower:
                       return 80
-              
-              # Priority 4: HR (70 points)
               for kw in PRIORITY_4:
                   if kw in pos_lower:
                       return 70
-              
-              # Generic manager/director - low priority but acceptable
               if 'manager' in pos_lower or 'director' in pos_lower:
                   return 40
-              
-              # Has a position but unknown type
               return 20
-          
+
           def find_best_contact(contacts):
-              """
-              Find the best contact from Hunter results.
-              Only returns contacts with score >= 40.
-              """
               if not contacts:
                   return None, 0
-              
-              # Score all contacts
-              scored = []
-              for c in contacts:
-                  score = score_contact(c.get('position', ''))
-                  if score > 0:  # Not excluded
-                      scored.append((score, c))
-              
+              scored = [(score_contact(c.get('position', '')), c) for c in contacts if score_contact(c.get('position', '')) > 0]
               if not scored:
                   return None, 0
-              
-              # Sort by score (highest first), then by confidence
               scored.sort(key=lambda x: (x[0], x[1].get('confidence', 0)), reverse=True)
-              
-              # Return best if score >= 40
-              best_score, best_contact = scored[0]
-              if best_score >= 40:
-                  return best_contact, best_score
-              
+              if scored[0][0] >= 40:
+                  return scored[0][1], scored[0][0]
               return None, 0
-          
+
           def get_companies_to_enrich(limit):
-              """
-              Get hot leads that need Hunter enrichment.
-              Prioritizes by score and excludes already-searched companies.
-              """
               try:
-                  # Get hot leads ordered by priority
-                  sh = supabase.table('signal_history').select(
-                      'company_id, priority_rank, propensity_score'
-                  ).eq('score_tier', 'hot').order('priority_rank').limit(500).execute()
-                  
+                  sh = supabase.table('signal_history').select('company_id, priority_rank').eq('score_tier', 'hot').order('priority_rank').limit(500).execute()
                   company_ids = [s['company_id'] for s in sh.data]
-                  
-                  # Get companies with website but NO Hunter pattern yet
-                  cm = supabase.table('company_master').select(
-                      'id, company_name, website, city, state, industry'
-                  ).in_('id', company_ids).not_.is_(
-                      'website', 'null'
-                  ).is_(
-                      'hunter_email_pattern', 'null'  # Not yet searched
-                  ).limit(limit * 2).execute()  # Get extra in case some have bad domains
-                  
-                  # Sort by priority
+                  cm = supabase.table('company_master').select('id, company_name, website, city, state').in_('id', company_ids).not_.is_('website', 'null').is_('hunter_email_pattern', 'null').limit(limit * 2).execute()
                   priority_lookup = {s['company_id']: s['priority_rank'] for s in sh.data}
                   results = [{**c, 'rank': priority_lookup.get(c['id'], 999)} for c in cm.data]
                   results.sort(key=lambda x: x['rank'])
-                  
                   return results[:limit]
-                  
               except Exception as e:
                   print(f"Database error: {e}")
                   return []
-          
+
           def save_enrichment(company_id, pattern, contact, contact_score):
-              """
-              Save Hunter results to database using company ID (more reliable).
-              """
               try:
-                  update = {
-                      'hunter_email_pattern': pattern,
-                      'hunter_lookup_date': datetime.now().isoformat(),
-                  }
-                  
-                  # Only save contact if score >= 70 (relevant role)
+                  update = {'hunter_email_pattern': pattern, 'hunter_lookup_date': datetime.now().isoformat()}
                   if contact and contact_score >= 70:
                       update['primary_contact_name'] = contact.get('name')
                       if contact.get('position'):
@@ -304,156 +172,95 @@ jobs:
                           update['primary_contact_phone'] = contact['phone']
                       if contact.get('linkedin'):
                           update['primary_contact_linkedin'] = contact['linkedin']
-                  
                   supabase.table('company_master').update(update).eq('id', company_id).execute()
                   return True
-                  
               except Exception as e:
                   print(f"Save error: {e}")
                   return False
-          
+
           def mark_searched(company_id):
-              """Mark company as searched even if no pattern found."""
               try:
-                  supabase.table('company_master').update({
-                      'hunter_lookup_date': datetime.now().isoformat(),
-                  }).eq('id', company_id).execute()
+                  supabase.table('company_master').update({'hunter_lookup_date': datetime.now().isoformat()}).eq('id', company_id).execute()
               except:
                   pass
-          
-          # =============================================================
-          # MAIN EXECUTION
-          # =============================================================
-          
+
           print("=" * 70)
           print("HUNTER.IO ENRICHMENT v2 - OPTIMIZED")
           print("=" * 70)
-          print("Improvements:")
-          print("  • Domain validation before API call")
-          print("  • Strict contact prioritization (excludes wrong types)")
-          print("  • Requests 20 contacts (not 10)")
-          print("  • Saves by company ID (reliable)")
-          print("  • Tracks searched companies")
-          print("=" * 70)
-          
-          # Check credits
+
           credits = check_credits()
           print(f"\n💳 Credits available: {credits}")
           print(f"🎯 Requested limit: {LIMIT}")
-          
+
           if credits == 0:
               print("❌ No credits remaining!")
               exit(0)
-          
-          # Adjust limit to available credits
+
           actual_limit = min(LIMIT, credits)
           print(f"📋 Will process: {actual_limit} companies\n")
-          
-          # Get companies
+
           companies = get_companies_to_enrich(actual_limit)
-          
           if not companies:
               print("⚠️ No companies found needing enrichment")
               exit(0)
-          
+
           print(f"Found {len(companies)} companies to enrich\n")
-          print("-" * 70)
-          
-          # Counters
-          processed = 0
-          patterns_found = 0
-          good_contacts = 0
-          bad_domains = 0
-          api_errors = 0
-          
+
+          processed, patterns_found, good_contacts, bad_domains = 0, 0, 0, 0
+
           for i, co in enumerate(companies, 1):
               if processed >= actual_limit:
                   break
-              
               company_id = co['id']
               name = co['company_name']
               website = co.get('website', '')
               city = co.get('city', '')
               state = co.get('state', '')
-              
-              # Validate domain BEFORE making API call
+
               domain = validate_domain(website)
-              
               if not domain:
-                  print(f"  {i}. {name} - ⚠️ Invalid domain: {website}")
-                  mark_searched(company_id)  # Mark to avoid retry
+                  print(f"  {i}. {name} - ⚠️ Invalid domain")
+                  mark_searched(company_id)
                   bad_domains += 1
                   continue
-              
-              print(f"  {i}. {name} ({domain}) [{city}, {state}]")
-              
-              # Search Hunter
+
+              print(f"  {i}. {name} ({domain})")
               result = domain_search(domain)
               processed += 1
-              
+
               if result.get('success'):
                   pattern = result.get('pattern')
-                  contacts = result.get('contacts', [])
-                  
                   if pattern:
                       patterns_found += 1
-                      
-                      # Find best contact
-                      best_contact, score = find_best_contact(contacts)
-                      
+                      best_contact, score = find_best_contact(result.get('contacts', []))
                       if best_contact and score >= 70:
-                          tier = "T1" if score >= 90 else "T2" if score >= 70 else "T3"
-                          print(f"      ✓ Pattern: {pattern}")
-                          print(f"      ✓ {tier}: {best_contact['name']} - {best_contact.get('position', 'N/A')}")
+                          tier = "T1" if score >= 90 else "T2"
+                          print(f"      ✓ Pattern: {pattern} | {tier}: {best_contact['name']}")
                           good_contacts += 1
                       else:
-                          print(f"      ✓ Pattern: {pattern}")
-                          print(f"      ⚠️ No relevant contact (will use X-Ray later)")
-                      
-                      # Save to database
+                          print(f"      ✓ Pattern: {pattern} | No relevant contact")
                       save_enrichment(company_id, pattern, best_contact, score)
                   else:
                       print(f"      ✗ No pattern found")
                       mark_searched(company_id)
               else:
-                  error = result.get('error', 'Unknown')
-                  print(f"      ✗ API error: {error}")
+                  print(f"      ✗ Error: {result.get('error', 'Unknown')}")
                   mark_searched(company_id)
-                  api_errors += 1
-              
-              # Rate limiting
+
               time.sleep(1)
-          
-          # =============================================================
-          # SUMMARY
-          # =============================================================
-          
+
           print(f"\n{'=' * 70}")
           print("SUMMARY")
           print("=" * 70)
-          print(f"  Companies processed: {processed}")
-          print(f"  Patterns captured: {patterns_found} ({100*patterns_found//max(processed,1)}%)")
-          print(f"  Good contacts (T1/T2): {good_contacts}")
-          print(f"  Need X-Ray search: {patterns_found - good_contacts}")
-          print(f"  Bad domains skipped: {bad_domains}")
-          print(f"  API errors: {api_errors}")
-          
-          remaining = check_credits()
-          print(f"  Credits remaining: {remaining}")
-          
-          print(f"\n💡 Next: Run X-Ray v3 to find contacts for companies with patterns!")
+          print(f"  Processed: {processed}")
+          print(f"  Patterns found: {patterns_found}")
+          print(f"  Good contacts: {good_contacts}")
+          print(f"  Need X-Ray: {patterns_found - good_contacts}")
+          print(f"  Credits remaining: {check_credits()}")
           PYTHONEOF
-        env:
-          LIMIT: ${{ inputs.limit }}
 
       - name: "Write Summary"
         run: |
           echo "## Hunter.io Enrichment v2 Complete" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**Optimizations Applied:**" >> $GITHUB_STEP_SUMMARY
-          echo "- Domain validation before API calls" >> $GITHUB_STEP_SUMMARY
-          echo "- Strict contact prioritization" >> $GITHUB_STEP_SUMMARY  
-          echo "- 20 contacts per search (vs 10)" >> $GITHUB_STEP_SUMMARY
-          echo "- Reliable ID-based saves" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**Next Step:** Run X-Ray v3 to find contacts for pattern-enriched companies" >> $GITHUB_STEP_SUMMARY
+          echo "**Next Step:** Run X-Ray v3 to find contacts" >> $GITHUB_STEP_SUMMARY
