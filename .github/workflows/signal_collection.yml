@@ -1,0 +1,150 @@
+name: "Weekly Signal Collection"
+
+on:
+  schedule:
+    - cron: '0 14 * * 1'  # Monday 8 AM Central
+  workflow_dispatch:
+    inputs:
+      companies:
+        description: 'Number of companies to check'
+        required: false
+        default: '20'
+        type: choice
+        options:
+          - '10'
+          - '20'
+          - '30'
+
+jobs:
+  collect-signals:
+    name: "Collect Market Signals"
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: "Checkout"
+        uses: actions/checkout@v4
+
+      - name: "Setup Python"
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: "Install dependencies"
+        run: pip install requests supabase
+
+      - name: "Collect Job Posting Signals"
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          SERPAPI_KEY: ${{ secrets.SERPAPI_KEY }}
+          COMPANIES: ${{ inputs.companies || '20' }}
+        run: |
+          python << 'PYTHONEOF'
+          import os
+          import time
+          import requests
+          from datetime import datetime
+          from supabase import create_client
+
+          SUPABASE_URL = os.environ['SUPABASE_URL']
+          SUPABASE_KEY = os.environ['SUPABASE_KEY']
+          SERPAPI_KEY = os.environ.get('SERPAPI_KEY', '')
+          COMPANY_LIMIT = int(os.environ.get('COMPANIES', '20'))
+
+          supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+          print("=" * 70)
+          print("WEEKLY SIGNAL COLLECTION")
+          print(f"Date: {datetime.now().strftime('%Y-%m-%d')}")
+          print("=" * 70)
+
+          # Get top companies
+          result = supabase.table('signal_history').select(
+              'company_master(company_name)'
+          ).eq('score_tier', 'hot').not_.is_('priority_rank', 'null').order('priority_rank').limit(COMPANY_LIMIT).execute()
+
+          companies = []
+          for r in result.data:
+              cm = r.get('company_master')
+              if cm and cm.get('company_name'):
+                  companies.append(cm['company_name'])
+
+          print(f"\n📋 Checking {len(companies)} companies for job postings\n")
+
+          if not SERPAPI_KEY:
+              print("⚠️ SERPAPI_KEY not set - skipping automated collection")
+              print("\nManual check required:")
+              print("1. Go to Indeed.com")
+              print("2. Search '[Company] warehouse Texas' for each company")
+              print("3. Record job counts in Google Sheets 📡 Market Signals tab")
+              exit(0)
+
+          snapshot_date = datetime.now().strftime('%Y-%m-%d')
+          high_velocity = []
+
+          for i, company in enumerate(companies, 1):
+              print(f"{i}. {company}...", end=" ")
+              
+              try:
+                  # Search for warehouse/production jobs
+                  url = "https://serpapi.com/search"
+                  params = {
+                      "engine": "google_jobs",
+                      "q": f'"{company}" warehouse OR production Texas',
+                      "api_key": SERPAPI_KEY,
+                  }
+                  
+                  response = requests.get(url, params=params, timeout=30)
+                  data = response.json()
+                  job_count = len(data.get('jobs_results', []))
+                  
+                  # Save to database
+                  signal = {
+                      'company_name': company,
+                      'snapshot_date': snapshot_date,
+                      'light_industrial_jobs': job_count,
+                      'is_urgent_hiring': job_count >= 10,
+                      'velocity_score': min(job_count * 5, 100)
+                  }
+                  
+                  supabase.table('job_posting_signals').upsert(
+                      signal,
+                      on_conflict='company_name,snapshot_date'
+                  ).execute()
+                  
+                  status = "🔥 URGENT" if job_count >= 10 else ""
+                  print(f"{job_count} jobs {status}")
+                  
+                  if job_count >= 10:
+                      high_velocity.append((company, job_count))
+                  
+                  time.sleep(2)  # Rate limiting
+                  
+              except Exception as e:
+                  print(f"Error: {e}")
+
+          print("\n" + "=" * 70)
+          print("SUMMARY")
+          print("=" * 70)
+          print(f"Companies checked: {len(companies)}")
+          print(f"High velocity (10+ jobs): {len(high_velocity)}")
+          
+          if high_velocity:
+              print("\n🔥 HIGH VELOCITY COMPANIES:")
+              for company, count in sorted(high_velocity, key=lambda x: -x[1]):
+                  print(f"   {company}: {count} jobs")
+          
+          print("\n✅ Signals saved to database")
+          print("Run Google Sheets export to see updated data")
+          PYTHONEOF
+
+      - name: "Write Summary"
+        run: |
+          echo "## Weekly Signal Collection Complete" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Job posting velocity checked for top companies." >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Next Steps:**" >> $GITHUB_STEP_SUMMARY
+          echo "1. Run Google Sheets export to update dashboard" >> $GITHUB_STEP_SUMMARY
+          echo "2. Review high-velocity companies for outreach" >> $GITHUB_STEP_SUMMARY
+          echo "3. Check TWC WARN notices manually" >> $GITHUB_STEP_SUMMARY
