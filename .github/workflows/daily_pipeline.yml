@@ -1,0 +1,675 @@
+name: "Daily Pipeline + Sheets Export"
+
+on:
+  schedule:
+    - cron: '0 12 * * *'  # 6 AM Central daily
+  workflow_dispatch:
+    inputs:
+      refresh_signals:
+        description: 'Also refresh external signals (WARN, jobs)?'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'false'
+          - 'true'
+
+jobs:
+  pipeline-and-export:
+    name: "Score & Export to Google Sheets"
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: "Checkout"
+        uses: actions/checkout@v4
+
+      - name: "Setup Python"
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: "Install dependencies"
+        run: pip install requests supabase gspread google-auth
+
+      - name: "Run Pipeline & Export"
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          GOOGLE_SHEETS_CREDS: ${{ secrets.GOOGLE_SHEETS_CREDS }}
+          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
+          REFRESH_SIGNALS: ${{ inputs.refresh_signals }}
+        run: |
+          python << 'PYTHONEOF'
+          import os
+          import json
+          import gspread
+          from datetime import datetime, timedelta
+          from google.oauth2.service_account import Credentials
+          from supabase import create_client
+
+          # ================================================================
+          # CONFIGURATION
+          # ================================================================
+          
+          SUPABASE_URL = os.environ['SUPABASE_URL']
+          SUPABASE_KEY = os.environ['SUPABASE_KEY']
+          GOOGLE_SHEET_ID = os.environ['GOOGLE_SHEET_ID']
+          
+          supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+          
+          # Google Sheets setup
+          creds_json = json.loads(os.environ['GOOGLE_SHEETS_CREDS'])
+          creds = Credentials.from_service_account_info(creds_json, scopes=[
+              'https://www.googleapis.com/auth/spreadsheets',
+              'https://www.googleapis.com/auth/drive'
+          ])
+          gc = gspread.authorize(creds)
+          spreadsheet = gc.open_by_key(GOOGLE_SHEET_ID)
+          
+          print("=" * 70)
+          print("PROPENSITY ENGINE - GOOGLE SHEETS EXPORT")
+          print(f"Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+          print("=" * 70)
+
+          # ================================================================
+          # HELPER FUNCTIONS
+          # ================================================================
+          
+          def get_or_create_sheet(name, rows=1000, cols=30):
+              """Get existing sheet or create new one."""
+              try:
+                  return spreadsheet.worksheet(name)
+              except gspread.WorksheetNotFound:
+                  return spreadsheet.add_worksheet(title=name, rows=rows, cols=cols)
+          
+          def clear_and_write(sheet, data, start='A1'):
+              """Clear sheet and write new data."""
+              sheet.clear()
+              if data:
+                  sheet.update(start, data, value_input_option='USER_ENTERED')
+          
+          def format_date(dt):
+              """Format datetime for display."""
+              if not dt:
+                  return ''
+              if isinstance(dt, str):
+                  try:
+                      dt = datetime.fromisoformat(dt.replace('Z', '+00:00'))
+                  except:
+                      return dt[:10] if len(dt) >= 10 else dt
+              return dt.strftime('%Y-%m-%d')
+
+          # ================================================================
+          # SHEET 1: SUMMARY DASHBOARD
+          # ================================================================
+          
+          print("\n📊 Building Summary Dashboard...")
+          
+          # Fetch summary statistics
+          hot_leads = supabase.table('signal_history').select('id', count='exact').eq('score_tier', 'hot').execute()
+          warm_leads = supabase.table('signal_history').select('id', count='exact').eq('score_tier', 'warm').execute()
+          cool_leads = supabase.table('signal_history').select('id', count='exact').eq('score_tier', 'cool').execute()
+          
+          # Contact enrichment stats
+          with_pattern = supabase.table('company_master').select('id', count='exact').not_.is_('hunter_email_pattern', 'null').execute()
+          with_contact = supabase.table('company_master').select('id', count='exact').not_.is_('primary_contact_email', 'null').execute()
+          
+          # Fortune 500 stats
+          f500_count = supabase.table('company_master').select('id', count='exact').eq('is_fortune_500', True).execute()
+          
+          # Get recent activity
+          recent_enriched = supabase.table('company_master').select(
+              'company_name, hunter_lookup_date'
+          ).not_.is_('hunter_lookup_date', 'null').order('hunter_lookup_date', desc=True).limit(5).execute()
+          
+          # Build summary data
+          summary_data = [
+              ['🎯 PROPENSITY ENGINE DASHBOARD', '', '', f'Last Updated: {datetime.now().strftime("%Y-%m-%d %H:%M")}'],
+              [''],
+              ['═══════════════════════════════════════════════════════════════════'],
+              ['📈 PIPELINE OVERVIEW', '', '', ''],
+              ['═══════════════════════════════════════════════════════════════════'],
+              [''],
+              ['Metric', 'Count', 'Percentage', 'Action'],
+              ['🔥 Hot Leads (85-100)', hot_leads.count or 0, '', '→ Priority outreach this week'],
+              ['🟡 Warm Leads (70-84)', warm_leads.count or 0, '', '→ Nurture sequence'],
+              ['🔵 Cool Leads (50-69)', cool_leads.count or 0, '', '→ Monitor for signals'],
+              [''],
+              ['═══════════════════════════════════════════════════════════════════'],
+              ['📧 CONTACT ENRICHMENT STATUS', '', '', ''],
+              ['═══════════════════════════════════════════════════════════════════'],
+              [''],
+              ['Metric', 'Count', 'Rate', 'Status'],
+              ['Companies with Email Pattern', with_pattern.count or 0, f'{((with_pattern.count or 0) / max((hot_leads.count or 1), 1) * 100):.1f}%', ''],
+              ['Companies with Contact Email', with_contact.count or 0, f'{((with_contact.count or 0) / max((hot_leads.count or 1), 1) * 100):.1f}%', ''],
+              ['Fortune 500 Companies', f500_count.count or 0, '', '→ Use facility-level targeting'],
+              [''],
+              ['═══════════════════════════════════════════════════════════════════'],
+              ['🚨 MARKET SIGNALS & ALERTS', '', '', ''],
+              ['═══════════════════════════════════════════════════════════════════'],
+              [''],
+              ['Signal Type', 'This Week', 'This Month', 'Trend'],
+              ['WARN Layoff Notices (TX)', '—', '—', '⬆️ Check TWC website'],
+              ['Indeed Job Postings (Light Industrial)', '—', '—', '📊 Monitor weekly'],
+              ['Building Permits (DFW)', '—', '—', '🏗️ New construction = hiring'],
+              [''],
+              ['═══════════════════════════════════════════════════════════════════'],
+              ['✅ RECENT ENRICHMENT ACTIVITY', '', '', ''],
+              ['═══════════════════════════════════════════════════════════════════'],
+              [''],
+              ['Company', 'Enriched Date', '', ''],
+          ]
+          
+          for r in (recent_enriched.data or []):
+              summary_data.append([r.get('company_name', ''), format_date(r.get('hunter_lookup_date')), '', ''])
+          
+          summary_data.extend([
+              [''],
+              ['═══════════════════════════════════════════════════════════════════'],
+              ['📋 THIS WEEK\'S PRIORITIES', '', '', ''],
+              ['═══════════════════════════════════════════════════════════════════'],
+              [''],
+              ['Priority', 'Task', 'Target', 'Status'],
+              ['1', 'Enrich top 20 hot leads (Hunter)', '20 companies', '⬜ Pending'],
+              ['2', 'LinkedIn research for Fortune 500', '10 contacts', '⬜ Pending'],
+              ['3', 'Send outreach to ready contacts', '15 emails', '⬜ Pending'],
+              ['4', 'Review WARN notices for opportunities', 'Check daily', '⬜ Pending'],
+              ['5', 'Update job posting signals', 'Weekly refresh', '⬜ Pending'],
+          ])
+          
+          summary_sheet = get_or_create_sheet('📊 Summary')
+          clear_and_write(summary_sheet, summary_data)
+          print(f"   ✅ Summary: Dashboard updated")
+
+          # ================================================================
+          # SHEET 2: HOT LEADS (Priority Outreach)
+          # ================================================================
+          
+          print("\n🔥 Exporting Hot Leads...")
+          
+          # Get hot leads with all enrichment data
+          hot_query = supabase.table('signal_history').select(
+              '''
+              company_id,
+              propensity_score,
+              priority_rank,
+              score_tier,
+              company_master (
+                  id,
+                  company_name,
+                  city,
+                  state,
+                  website,
+                  employee_count,
+                  annual_revenue,
+                  industry,
+                  is_fortune_500,
+                  hunter_email_pattern,
+                  hunter_lookup_date,
+                  primary_contact_name,
+                  primary_contact_title,
+                  primary_contact_email,
+                  primary_contact_phone,
+                  primary_contact_linkedin,
+                  suggested_email_template
+              )
+              '''
+          ).eq('score_tier', 'hot').not_.is_('priority_rank', 'null').order('priority_rank').limit(500).execute()
+          
+          hot_headers = [
+              'Rank', 'Company', 'Score', 'City', 'State', 'Industry',
+              'Employees', 'Revenue', 'F500', 'Website',
+              'Email Pattern', 'Contact Name', 'Contact Title', 'Contact Email',
+              'Contact Phone', 'LinkedIn', 'Template', 'Enriched Date',
+              'Outreach Status', 'Notes'
+          ]
+          
+          hot_rows = [hot_headers]
+          for h in (hot_query.data or []):
+              cm = h.get('company_master') or {}
+              
+              # Determine contact quality
+              title = (cm.get('primary_contact_title') or '').lower()
+              if 'procurement' in title or 'purchasing' in title:
+                  contact_quality = '🎯 Procurement'
+              elif 'plant' in title or 'facility' in title:
+                  contact_quality = '✅ Plant Mgr'
+              elif 'operations' in title:
+                  contact_quality = '✅ Operations'
+              elif cm.get('primary_contact_name'):
+                  contact_quality = '⚠️ Other'
+              else:
+                  contact_quality = '❌ None'
+              
+              hot_rows.append([
+                  h.get('priority_rank', ''),
+                  cm.get('company_name', ''),
+                  h.get('propensity_score', ''),
+                  cm.get('city', ''),
+                  cm.get('state', ''),
+                  cm.get('industry', ''),
+                  cm.get('employee_count', ''),
+                  cm.get('annual_revenue', ''),
+                  '✅' if cm.get('is_fortune_500') else '',
+                  cm.get('website', ''),
+                  cm.get('hunter_email_pattern', ''),
+                  cm.get('primary_contact_name', ''),
+                  cm.get('primary_contact_title', ''),
+                  cm.get('primary_contact_email', ''),
+                  cm.get('primary_contact_phone', ''),
+                  cm.get('primary_contact_linkedin', ''),
+                  cm.get('suggested_email_template', ''),
+                  format_date(cm.get('hunter_lookup_date')),
+                  '',  # Outreach status (manual)
+                  ''   # Notes (manual)
+              ])
+          
+          hot_sheet = get_or_create_sheet('🔥 Hot Leads')
+          clear_and_write(hot_sheet, hot_rows)
+          print(f"   ✅ Hot Leads: {len(hot_rows)-1} companies exported")
+
+          # ================================================================
+          # SHEET 3: FORTUNE 500 TARGETS
+          # ================================================================
+          
+          print("\n🏢 Exporting Fortune 500 Targets...")
+          
+          f500_query = supabase.table('signal_history').select(
+              '''
+              company_id,
+              propensity_score,
+              priority_rank,
+              company_master!inner (
+                  id,
+                  company_name,
+                  city,
+                  state,
+                  website,
+                  is_fortune_500,
+                  fortune_500_rank,
+                  hunter_email_pattern,
+                  primary_contact_name,
+                  primary_contact_title,
+                  primary_contact_email
+              )
+              '''
+          ).eq('company_master.is_fortune_500', True).order('priority_rank').execute()
+          
+          f500_headers = [
+              'Priority', 'Company', 'Score', 'F500 Rank', 'City', 'State',
+              'Website', 'Has Pattern', 'Contact Name', 'Contact Title',
+              'Contact Email', 'Research Status', 'LinkedIn Search URL', 'Notes'
+          ]
+          
+          f500_rows = [f500_headers]
+          for f in (f500_query.data or []):
+              cm = f.get('company_master') or {}
+              company_name = cm.get('company_name', '')
+              
+              # Generate LinkedIn X-Ray URL
+              xray_url = f'https://www.google.com/search?q=site:linkedin.com/in+"plant+manager"+"{company_name.replace(" ", "+")}"+"Texas"'
+              
+              # Research status
+              if cm.get('primary_contact_email'):
+                  status = '✅ Ready'
+              elif cm.get('hunter_email_pattern'):
+                  status = '🔍 Need Contact'
+              else:
+                  status = '❌ Need Pattern'
+              
+              f500_rows.append([
+                  f.get('priority_rank', ''),
+                  company_name,
+                  f.get('propensity_score', ''),
+                  cm.get('fortune_500_rank', ''),
+                  cm.get('city', ''),
+                  cm.get('state', ''),
+                  cm.get('website', ''),
+                  '✅' if cm.get('hunter_email_pattern') else '❌',
+                  cm.get('primary_contact_name', ''),
+                  cm.get('primary_contact_title', ''),
+                  cm.get('primary_contact_email', ''),
+                  status,
+                  xray_url,
+                  ''
+              ])
+          
+          f500_sheet = get_or_create_sheet('🏢 Fortune 500')
+          clear_and_write(f500_sheet, f500_rows)
+          print(f"   ✅ Fortune 500: {len(f500_rows)-1} companies exported")
+
+          # ================================================================
+          # SHEET 4: READY TO CONTACT
+          # ================================================================
+          
+          print("\n📧 Exporting Ready-to-Contact List...")
+          
+          ready_query = supabase.table('company_master').select(
+              '''
+              id,
+              company_name,
+              city,
+              state,
+              website,
+              hunter_email_pattern,
+              primary_contact_name,
+              primary_contact_title,
+              primary_contact_email,
+              primary_contact_phone,
+              primary_contact_linkedin,
+              suggested_email_template
+              '''
+          ).not_.is_('primary_contact_email', 'null').not_.is_('hunter_email_pattern', 'null').limit(200).execute()
+          
+          ready_headers = [
+              'Company', 'City', 'State', 'Contact Name', 'Title', 
+              'Email', 'Phone', 'LinkedIn', 'Email Pattern',
+              'Template', 'Sent Date', 'Response', 'Follow-up Date'
+          ]
+          
+          ready_rows = [ready_headers]
+          for r in (ready_query.data or []):
+              ready_rows.append([
+                  r.get('company_name', ''),
+                  r.get('city', ''),
+                  r.get('state', ''),
+                  r.get('primary_contact_name', ''),
+                  r.get('primary_contact_title', ''),
+                  r.get('primary_contact_email', ''),
+                  r.get('primary_contact_phone', ''),
+                  r.get('primary_contact_linkedin', ''),
+                  r.get('hunter_email_pattern', ''),
+                  r.get('suggested_email_template', ''),
+                  '',  # Sent date (manual)
+                  '',  # Response (manual)
+                  ''   # Follow-up (manual)
+              ])
+          
+          ready_sheet = get_or_create_sheet('📧 Ready to Contact')
+          clear_and_write(ready_sheet, ready_rows)
+          print(f"   ✅ Ready to Contact: {len(ready_rows)-1} contacts exported")
+
+          # ================================================================
+          # SHEET 5: ENRICHMENT QUEUE
+          # ================================================================
+          
+          print("\n🔍 Exporting Enrichment Queue...")
+          
+          # Companies needing enrichment (have score but no pattern)
+          queue_query = supabase.table('signal_history').select(
+              '''
+              company_id,
+              propensity_score,
+              priority_rank,
+              company_master (
+                  id,
+                  company_name,
+                  city,
+                  state,
+                  website,
+                  hunter_email_pattern,
+                  hunter_lookup_date,
+                  primary_contact_name
+              )
+              '''
+          ).eq('score_tier', 'hot').not_.is_('priority_rank', 'null').order('priority_rank').limit(300).execute()
+          
+          queue_headers = [
+              'Rank', 'Company', 'Score', 'City', 'State', 'Website',
+              'Has Pattern', 'Has Contact', 'Hunter Date', 'Action Needed'
+          ]
+          
+          queue_rows = [queue_headers]
+          for q in (queue_query.data or []):
+              cm = q.get('company_master') or {}
+              
+              has_pattern = bool(cm.get('hunter_email_pattern'))
+              has_contact = bool(cm.get('primary_contact_name'))
+              
+              if not cm.get('website'):
+                  action = '⚠️ No website'
+              elif not has_pattern:
+                  action = '🔴 Run Hunter'
+              elif not has_contact:
+                  action = '🟡 Run X-Ray/Apollo'
+              else:
+                  action = '✅ Complete'
+              
+              queue_rows.append([
+                  q.get('priority_rank', ''),
+                  cm.get('company_name', ''),
+                  q.get('propensity_score', ''),
+                  cm.get('city', ''),
+                  cm.get('state', ''),
+                  cm.get('website', ''),
+                  '✅' if has_pattern else '❌',
+                  '✅' if has_contact else '❌',
+                  format_date(cm.get('hunter_lookup_date')),
+                  action
+              ])
+          
+          queue_sheet = get_or_create_sheet('🔍 Enrichment Queue')
+          clear_and_write(queue_sheet, queue_rows)
+          print(f"   ✅ Enrichment Queue: {len(queue_rows)-1} companies exported")
+
+          # ================================================================
+          # SHEET 6: MARKET SIGNALS (WARN, Jobs, Permits)
+          # ================================================================
+          
+          print("\n📡 Exporting Market Signals...")
+          
+          signals_data = [
+              ['📡 MARKET SIGNALS TRACKER', '', '', f'Updated: {datetime.now().strftime("%Y-%m-%d")}'],
+              [''],
+              ['═══════════════════════════════════════════════════════════════════════════════'],
+              ['🚨 WARN LAYOFF NOTICES (Texas)', '', '', '', '', ''],
+              ['═══════════════════════════════════════════════════════════════════════════════'],
+              [''],
+              ['Instructions: Check TWC WARN list weekly at https://www.twc.texas.gov/businesses/worker-adjustment-and-retraining-notification-warn-notices'],
+              ['Look for: Light industrial, manufacturing, warehouse, distribution companies in DFW'],
+              ['Opportunity: Companies laying off often need temp workers to backfill or transition'],
+              [''],
+              ['Date', 'Company', 'Location', 'Affected Workers', 'Layoff Date', 'Opportunity Score', 'Notes'],
+              ['', '', '', '', '', '', ''],
+              ['', '', '', '', '', '', ''],
+              ['', '', '', '', '', '', ''],
+              [''],
+              ['═══════════════════════════════════════════════════════════════════════════════'],
+              ['💼 INDEED JOB POSTING VELOCITY', '', '', '', '', ''],
+              ['═══════════════════════════════════════════════════════════════════════════════'],
+              [''],
+              ['Track: Search Indeed for "[Company] warehouse Texas" weekly'],
+              ['High posting velocity (5+ jobs/week) = urgent staffing need = hot lead'],
+              [''],
+              ['Week', 'Company', 'Job Count', 'Job Types', 'Locations', 'Velocity', 'Action'],
+              ['', '', '', '', '', '', ''],
+              ['', '', '', '', '', '', ''],
+              ['', '', '', '', '', '', ''],
+              [''],
+              ['═══════════════════════════════════════════════════════════════════════════════'],
+              ['🏗️ BUILDING PERMITS (DFW)', '', '', '', '', ''],
+              ['═══════════════════════════════════════════════════════════════════════════════'],
+              [''],
+              ['Track: New warehouse/industrial construction = future hiring'],
+              ['Sources: City permit databases, Dallas Morning News, CoStar'],
+              [''],
+              ['Date', 'Company/Project', 'Location', 'Type', 'Size (sq ft)', 'Est. Completion', 'Opportunity'],
+              ['', '', '', '', '', '', ''],
+              ['', '', '', '', '', '', ''],
+              [''],
+              ['═══════════════════════════════════════════════════════════════════════════════'],
+              ['📰 NEWS & EXPANSION ALERTS', '', '', '', '', ''],
+              ['═══════════════════════════════════════════════════════════════════════════════'],
+              [''],
+              ['Set up Google Alerts for: "[Company] expansion Texas", "[Company] hiring Texas"'],
+              [''],
+              ['Date', 'Company', 'Headline', 'Signal Type', 'Source', 'Action Taken', ''],
+              ['', '', '', '', '', '', ''],
+              ['', '', '', '', '', '', ''],
+              [''],
+              ['═══════════════════════════════════════════════════════════════════════════════'],
+              ['📊 SIGNAL SUMMARY (This Month)', '', '', '', '', ''],
+              ['═══════════════════════════════════════════════════════════════════════════════'],
+              [''],
+              ['Signal Type', 'Count', 'Converted to Leads', 'Conversion Rate', 'Top Opportunity', ''],
+              ['WARN Notices', '', '', '', '', ''],
+              ['Job Posting Spikes', '', '', '', '', ''],
+              ['Building Permits', '', '', '', '', ''],
+              ['News/Expansion', '', '', '', '', ''],
+          ]
+          
+          signals_sheet = get_or_create_sheet('📡 Market Signals')
+          clear_and_write(signals_sheet, signals_data)
+          print(f"   ✅ Market Signals: Template created")
+
+          # ================================================================
+          # SHEET 7: CONTACT QUALITY BREAKDOWN
+          # ================================================================
+          
+          print("\n👥 Exporting Contact Quality Analysis...")
+          
+          # Get all contacts with their quality
+          contacts_query = supabase.table('company_master').select(
+              'company_name, primary_contact_name, primary_contact_title, primary_contact_email, hunter_email_pattern'
+          ).not_.is_('hunter_email_pattern', 'null').limit(500).execute()
+          
+          # Categorize contacts
+          categories = {
+              '🎯 Procurement': [],
+              '✅ Plant/Facility': [],
+              '✅ Operations': [],
+              '🟡 HR': [],
+              '⚠️ Other': [],
+              '❌ No Contact': []
+          }
+          
+          for c in (contacts_query.data or []):
+              title = (c.get('primary_contact_title') or '').lower()
+              name = c.get('company_name', '')
+              
+              if not c.get('primary_contact_name'):
+                  categories['❌ No Contact'].append(name)
+              elif 'procurement' in title or 'purchasing' in title:
+                  categories['🎯 Procurement'].append(name)
+              elif 'plant' in title or 'facility' in title:
+                  categories['✅ Plant/Facility'].append(name)
+              elif 'operations' in title:
+                  categories['✅ Operations'].append(name)
+              elif 'hr' in title or 'human resources' in title:
+                  categories['🟡 HR'].append(name)
+              else:
+                  categories['⚠️ Other'].append(name)
+          
+          quality_data = [
+              ['👥 CONTACT QUALITY BREAKDOWN', '', f'Updated: {datetime.now().strftime("%Y-%m-%d")}'],
+              [''],
+              ['Category', 'Count', 'Percentage', 'Companies'],
+          ]
+          
+          total = sum(len(v) for v in categories.values())
+          for cat, companies in categories.items():
+              pct = f'{len(companies)/max(total,1)*100:.1f}%'
+              # Show first 5 companies
+              company_list = ', '.join(companies[:5]) + ('...' if len(companies) > 5 else '')
+              quality_data.append([cat, len(companies), pct, company_list])
+          
+          quality_data.extend([
+              [''],
+              ['═══════════════════════════════════════════════════════════════════'],
+              ['ACTION ITEMS', '', '', ''],
+              ['═══════════════════════════════════════════════════════════════════'],
+              [''],
+              [f'1. Run LinkedIn X-Ray for {len(categories["❌ No Contact"])} companies without contacts'],
+              [f'2. Review {len(categories["⚠️ Other"])} companies with wrong contact type'],
+              [f'3. {len(categories["🎯 Procurement"]) + len(categories["✅ Plant/Facility"]) + len(categories["✅ Operations"])} companies ready for outreach'],
+          ])
+          
+          quality_sheet = get_or_create_sheet('👥 Contact Quality')
+          clear_and_write(quality_sheet, quality_data)
+          print(f"   ✅ Contact Quality: Analysis complete")
+
+          # ================================================================
+          # SHEET 8: WEEKLY ACTIVITY LOG
+          # ================================================================
+          
+          print("\n📅 Creating Weekly Activity Log...")
+          
+          activity_data = [
+              ['📅 WEEKLY ACTIVITY LOG', '', '', '', f'Week of: {datetime.now().strftime("%Y-%m-%d")}'],
+              [''],
+              ['═══════════════════════════════════════════════════════════════════════════════'],
+              ['OUTREACH TRACKING', '', '', '', '', ''],
+              ['═══════════════════════════════════════════════════════════════════════════════'],
+              [''],
+              ['Date', 'Company', 'Contact', 'Method', 'Template Used', 'Response', 'Next Step'],
+              ['', '', '', '', '', '', ''],
+              ['', '', '', '', '', '', ''],
+              ['', '', '', '', '', '', ''],
+              ['', '', '', '', '', '', ''],
+              ['', '', '', '', '', '', ''],
+              [''],
+              ['═══════════════════════════════════════════════════════════════════════════════'],
+              ['ENRICHMENT ACTIVITY', '', '', '', '', ''],
+              ['═══════════════════════════════════════════════════════════════════════════════'],
+              [''],
+              ['Date', 'Activity', 'Companies Processed', 'Results', 'Credits Used', 'Notes'],
+              ['', 'Hunter.io Run', '', '', '', ''],
+              ['', 'Apollo Run', '', '', '', ''],
+              ['', 'LinkedIn X-Ray', '', '', '', ''],
+              ['', 'Manual Research', '', '', '', ''],
+              [''],
+              ['═══════════════════════════════════════════════════════════════════════════════'],
+              ['WEEKLY METRICS', '', '', '', '', ''],
+              ['═══════════════════════════════════════════════════════════════════════════════'],
+              [''],
+              ['Metric', 'Target', 'Actual', 'Status', '', ''],
+              ['Emails Sent', '15', '', '', '', ''],
+              ['Responses Received', '3', '', '', '', ''],
+              ['Meetings Booked', '1', '', '', '', ''],
+              ['Companies Enriched', '20', '', '', '', ''],
+              ['LinkedIn Searches', '10', '', '', '', ''],
+              [''],
+              ['═══════════════════════════════════════════════════════════════════════════════'],
+              ['NOTES & LEARNINGS', '', '', '', '', ''],
+              ['═══════════════════════════════════════════════════════════════════════════════'],
+              [''],
+              ['', '', '', '', '', ''],
+              ['', '', '', '', '', ''],
+          ]
+          
+          activity_sheet = get_or_create_sheet('📅 Activity Log')
+          clear_and_write(activity_sheet, activity_data)
+          print(f"   ✅ Activity Log: Template created")
+
+          # ================================================================
+          # FINAL SUMMARY
+          # ================================================================
+          
+          print("\n" + "=" * 70)
+          print("EXPORT COMPLETE")
+          print("=" * 70)
+          print(f"""
+          📊 Summary Dashboard    - KPIs & priorities
+          🔥 Hot Leads           - {len(hot_rows)-1} priority companies
+          🏢 Fortune 500         - {len(f500_rows)-1} enterprise targets
+          📧 Ready to Contact    - {len(ready_rows)-1} with email addresses
+          🔍 Enrichment Queue    - {len(queue_rows)-1} needing research
+          📡 Market Signals      - WARN, jobs, permits tracker
+          👥 Contact Quality     - Breakdown by contact type
+          📅 Activity Log        - Weekly tracking template
+          """)
+          PYTHONEOF
+
+      - name: "Write Summary"
+        run: |
+          echo "## Google Sheets Export Complete" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Sheets Updated:" >> $GITHUB_STEP_SUMMARY
+          echo "- 📊 Summary Dashboard" >> $GITHUB_STEP_SUMMARY
+          echo "- 🔥 Hot Leads" >> $GITHUB_STEP_SUMMARY
+          echo "- 🏢 Fortune 500" >> $GITHUB_STEP_SUMMARY
+          echo "- 📧 Ready to Contact" >> $GITHUB_STEP_SUMMARY
+          echo "- 🔍 Enrichment Queue" >> $GITHUB_STEP_SUMMARY
+          echo "- 📡 Market Signals" >> $GITHUB_STEP_SUMMARY
+          echo "- 👥 Contact Quality" >> $GITHUB_STEP_SUMMARY
+          echo "- 📅 Activity Log" >> $GITHUB_STEP_SUMMARY
